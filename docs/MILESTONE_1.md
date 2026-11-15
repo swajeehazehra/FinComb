@@ -128,6 +128,7 @@ sure Docker Desktop says "Engine running", then:
 ```powershell
 git clone https://github.com/swajeehazehra/FinComb.git
 cd FinComb
+git checkout milestone-1          # only needed until PR #1 is merged into main
 copy .env.example .env
 notepad .env                      # change POSTGRES_PASSWORD, save, close
 docker compose up -d db
@@ -153,6 +154,7 @@ In the commands below, `python` means `python3` on macOS/Linux.
 ```bash
 git clone https://github.com/swajeehazehra/FinComb.git
 cd FinComb
+git checkout milestone-1      # only needed until PR #1 is merged into main
 ```
 
 ### 4.2 Create your `.env`

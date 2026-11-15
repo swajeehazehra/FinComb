@@ -1,12 +1,9 @@
 # FinComb
 
-Financial intelligence and quantitative research platform integrating financial data
-engineering, statistical analytics, portfolio optimization, and algorithmic trading
-strategy backtesting.
-
-An end-to-end system for ingesting market data, validating it, storing it in PostgreSQL, and (in later
-milestones) analysing performance and risk, building portfolios and backtesting
-trading strategies without look-ahead bias.
+An end-to-end financial intelligence and quantitative research platform: it ingests
+and validates market data, stores it in PostgreSQL, and (in later milestones) analyses
+performance and risk, optimises portfolios and backtests trading strategies without
+look-ahead bias.
 
 Tech stack: Python · PostgreSQL · SQLAlchemy · Alembic · FastAPI · pandas / NumPy ·
 SciPy / Statsmodels · Plotly · Streamlit · Pytest · Docker
