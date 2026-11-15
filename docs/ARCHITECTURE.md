@@ -1,0 +1,337 @@
+# FinComb: Financial Intelligence & Quantitative Research Platform
+
+**Design document, v0.1 (approved). Milestone 1 implemented.**
+
+Python package name: `fincomb`.
+
+---
+
+## 1. Architecture
+
+### 1.1 Guiding principles
+
+1. **Layers only depend downward.** The dashboard never touches the database, and the quant code never touches the database or HTTP. That makes the maths testable as pure functions.
+2. **Pure quant core.** Everything in `analytics/`, `portfolio/`, `strategies/` and `backtest/` takes pandas objects in and returns pandas objects / dataclasses out. No I/O, no globals, no randomness without an explicit seed.
+3. **Pluggable data sources.** One `MarketDataSource` interface; yfinance is the default, Stooq is the fallback, and a CSV adapter feeds tests so the test suite never hits the network.
+4. **Reproducible by construction.** Every backtest run stores its parameters, the code version (git SHA), and a hash of the exact price data it used.
+5. **Configuration from environment.** `pydantic-settings` reads `.env` / env vars. No credentials in code; `.env` is git-ignored and `.env.example` documents every variable.
+
+### 1.2 Layer diagram
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Presentation      Streamlit dashboard  (talks HTTP only)    │
+└───────────────────────────────┬──────────────────────────────┘
+                                │ httpx (JSON)
+┌───────────────────────────────▼──────────────────────────────┐
+│  API               FastAPI routers + Pydantic schemas        │
+│                    (validation, error mapping, no maths)     │
+└───────────────────────────────┬──────────────────────────────┘
+                                │ calls
+┌───────────────────────────────▼──────────────────────────────┐
+│  Services          Orchestration: load data → run quant →    │
+│                    persist results. Owns DB sessions.        │
+└──────┬─────────────────────────────┬─────────────────────────┘
+       │                             │
+┌──────▼───────────────┐   ┌─────────▼──────────────────────────┐
+│ Data layer           │   │ Quant core (pure functions)        │
+│  ingestion/ adapters │   │  analytics/  returns, risk, corr   │
+│  validation/ rules   │   │  portfolio/  weights, optimisation │
+│  db/ models + repos  │   │  strategies/ momentum, mean-rev    │
+│  (SQLAlchemy 2.0)    │   │  backtest/   engine, costs, report │
+└──────┬───────────────┘   └────────────────────────────────────┘
+       │
+┌──────▼───────────────┐
+│ PostgreSQL 16        │   schema managed by Alembic migrations
+└──────────────────────┘
+```
+
+### 1.3 Key technology choices
+
+| Concern | Choice | Why |
+|---|---|---|
+| ORM / migrations | SQLAlchemy 2.0 + Alembic | Industry standard, typed, versioned schema |
+| Config | pydantic-settings | Typed env-var config, fails fast on missing values |
+| API | FastAPI + Pydantic v2 | Auto OpenAPI docs at `/docs`, request validation |
+| Data source | yfinance (default), Stooq via pandas-datareader (fallback) | Free, no API key; adapter pattern isolates breakage |
+| Optimisation | SciPy `minimize` (SLSQP) | Constrained min-variance / max-Sharpe without extra deps |
+| Statistics | Statsmodels | OLS beta/alpha vs benchmark, ADF test for mean-reversion |
+| Charts | Plotly | Same figures work in Streamlit and notebooks |
+| Logging | stdlib `logging` with JSON formatter option | No extra deps; structured logs in Docker |
+| Tests | Pytest, pytest-cov, Hypothesis (property tests) | Unit tests on pure core, integration tests on a real Postgres |
+| Lint / types | Ruff + mypy | Cheap quality signal for reviewers |
+| Packaging | `pyproject.toml`, src layout, pip | Simple for reviewers to install |
+| Runtime | Docker Compose: `db`, `api`, `dashboard` | One command to run the whole thing |
+
+Data frequency for the MVP is **daily bars** only. Intraday adds storage and calendar complexity without adding much to the portfolio story.
+
+---
+
+## 2. Database schema
+
+PostgreSQL 16. Prices are stored as `DOUBLE PRECISION` (analytics run in float64 anyway; money-exact `NUMERIC` buys nothing here and slows pandas conversion).
+
+### 2.1 Reference data
+
+**`instruments`**
+
+| column | type | notes |
+|---|---|---|
+| id | SERIAL PK | |
+| symbol | VARCHAR(20) UNIQUE NOT NULL | e.g. `AAPL`, `SPY` |
+| name | VARCHAR(200) | |
+| asset_type | ENUM(`stock`,`etf`,`index`) | |
+| exchange | VARCHAR(20) | |
+| currency | CHAR(3) DEFAULT 'USD' | |
+| is_active | BOOLEAN DEFAULT true | |
+| created_at | TIMESTAMPTZ DEFAULT now() | |
+
+### 2.2 Market data
+
+**`price_bars`** (daily OHLCV)
+
+| column | type | notes |
+|---|---|---|
+| instrument_id | INT FK → instruments | |
+| bar_date | DATE | trading date (exchange-local) |
+| open, high, low, close | DOUBLE PRECISION NOT NULL | raw (unadjusted) |
+| adj_close | DOUBLE PRECISION NOT NULL | split + dividend adjusted |
+| volume | BIGINT | |
+| source | VARCHAR(20) NOT NULL | `yfinance`, `stooq`, `csv` |
+| ingested_at | TIMESTAMPTZ DEFAULT now() | |
+| ingestion_run_id | INT FK → ingestion_runs | lineage |
+
+- **PK `(instrument_id, bar_date)`**, which also makes re-ingestion idempotent via `INSERT … ON CONFLICT DO UPDATE`.
+- CHECK constraints: `high >= greatest(open, close, low)`, `low <= least(open, close)`, prices `> 0`, `volume >= 0`.
+
+### 2.3 Data pipeline audit
+
+**`ingestion_runs`**: id, source, symbols TEXT[], start_date, end_date, started_at, finished_at, status ENUM(`running`,`success`,`partial`,`failed`), rows_inserted, rows_rejected, error_message.
+
+**`data_quality_issues`**: id, ingestion_run_id FK, instrument_id FK, bar_date, rule (e.g. `non_positive_price`, `ohlc_inconsistent`, `extreme_return`, `stale_price`, `gap`), severity ENUM(`warning`,`error`), detail TEXT. Errors are rejected, warnings are stored and flagged.
+
+### 2.4 Portfolios
+
+**`portfolios`**: id, name UNIQUE, description, construction_method (`manual`, `equal_weight`, `inverse_vol`, `min_variance`, `max_sharpe`), rebalance_frequency (`none`,`monthly`,`quarterly`), created_at.
+
+**`portfolio_weights`**: portfolio_id FK, instrument_id FK, weight DOUBLE PRECISION, PK `(portfolio_id, instrument_id)`. CHECK weight between -1 and 1; service layer enforces sum = 1 for long-only.
+
+### 2.5 Backtests
+
+**`backtest_runs`**
+
+| column | type | notes |
+|---|---|---|
+| id | SERIAL PK | |
+| strategy | VARCHAR(50) | `momentum`, `mean_reversion`, `buy_and_hold` |
+| params | JSONB | lookback, thresholds, etc. |
+| symbols | TEXT[] | universe |
+| benchmark_symbol | VARCHAR(20) | e.g. `SPY` |
+| start_date, end_date | DATE | |
+| initial_capital | DOUBLE PRECISION | |
+| cost_bps, slippage_bps | DOUBLE PRECISION | |
+| code_version | VARCHAR(40) | git SHA |
+| data_hash | CHAR(64) | SHA-256 of the input price frame |
+| metrics | JSONB | CAGR, vol, Sharpe, Sortino, MDD, turnover, alpha/beta… |
+| status | ENUM(`success`,`failed`) | |
+| created_at | TIMESTAMPTZ | |
+
+**`backtest_equity`**: run_id FK, bar_date, equity, cash, gross_exposure, benchmark_equity, drawdown. PK `(run_id, bar_date)`.
+
+**`backtest_trades`**: id, run_id FK, bar_date, instrument_id FK, quantity, fill_price, notional, commission, slippage_cost.
+
+Computed analytics (returns, correlations) are **not** stored; they are cheap to recompute from `price_bars` and storing them risks staleness. Only backtests are persisted because they are the "experiments" a researcher wants to compare later.
+
+---
+
+## 3. Folder structure
+
+```
+FinComb/
+├── pyproject.toml              # deps, ruff, mypy, pytest config
+├── README.md
+├── .env.example                # every env var documented, no secrets
+├── .gitignore
+├── docker-compose.yml          # db, api, dashboard
+├── docker/
+│   ├── api.Dockerfile
+│   └── dashboard.Dockerfile
+├── alembic.ini
+├── migrations/                 # Alembic versions
+├── docs/
+│   ├── ARCHITECTURE.md         # this document
+│   ├── METHODOLOGY.md          # formulas, assumptions, bias controls
+│   └── adr/                    # short architecture decision records
+├── src/fincomb/
+│   ├── config.py               # pydantic-settings Settings
+│   ├── logging_config.py
+│   ├── exceptions.py           # domain errors → mapped to HTTP codes
+│   ├── db/
+│   │   ├── base.py             # engine, session factory
+│   │   ├── models.py           # SQLAlchemy ORM models
+│   │   └── repositories.py     # InstrumentRepo, PriceRepo, BacktestRepo
+│   ├── ingestion/
+│   │   ├── base.py             # MarketDataSource protocol
+│   │   ├── yfinance_source.py
+│   │   ├── stooq_source.py
+│   │   ├── csv_source.py       # offline / tests
+│   │   └── pipeline.py         # fetch → validate → upsert → audit
+│   ├── validation/
+│   │   └── rules.py            # data-quality rules returning issues
+│   ├── analytics/
+│   │   ├── returns.py          # simple/log returns, CAGR, rolling
+│   │   ├── risk.py             # vol, Sharpe, Sortino, MDD, VaR, CVaR, beta
+│   │   └── correlation.py
+│   ├── portfolio/
+│   │   ├── construction.py     # equal, inverse-vol, min-var, max-Sharpe
+│   │   └── analysis.py         # portfolio returns, risk contribution
+│   ├── strategies/
+│   │   ├── base.py             # Strategy ABC: generate_weights(prices)
+│   │   ├── momentum.py         # cross-sectional / time-series momentum
+│   │   ├── mean_reversion.py   # z-score / Bollinger reversion
+│   │   └── buy_and_hold.py
+│   ├── backtest/
+│   │   ├── engine.py           # vectorised daily engine
+│   │   ├── costs.py            # commission + slippage models
+│   │   └── report.py           # metrics + benchmark comparison
+│   ├── services/               # orchestration used by API and CLI
+│   │   ├── market_data.py
+│   │   ├── analytics_service.py
+│   │   ├── portfolio_service.py
+│   │   └── backtest_service.py
+│   ├── api/
+│   │   ├── main.py             # app factory, middleware, error handlers
+│   │   ├── deps.py             # DB session dependency
+│   │   ├── schemas/            # Pydantic request/response models
+│   │   └── routers/            # health, instruments, prices, analytics,
+│   │                           # portfolios, strategies, backtests, ingestion
+│   └── cli.py                  # `fincomb ingest`, `fincomb backtest`
+├── dashboard/
+│   ├── app.py                  # Streamlit entry
+│   ├── api_client.py           # thin httpx wrapper
+│   ├── charts.py               # Plotly figure builders
+│   └── pages/                  # Market, Performance, Correlation,
+│                               # Portfolio, Backtest
+└── tests/
+    ├── conftest.py
+    ├── fixtures/               # small CSV price files (checked in)
+    ├── unit/                   # pure quant + validation tests
+    └── integration/            # Postgres + API tests
+```
+
+---
+
+## 4. API endpoints
+
+Base path `/api/v1`. All responses JSON; errors use one shape: `{"error": {"code": "...", "message": "...", "details": {...}}}`. Dates are ISO `YYYY-MM-DD`.
+
+### System
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/health` | Liveness + DB connectivity |
+
+### Instruments & data
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/instruments` | List (filter `asset_type`, `active`) |
+| POST | `/instruments` | Register a symbol |
+| GET | `/instruments/{symbol}` | Detail + data coverage (first/last date, bar count) |
+| GET | `/prices/{symbol}` | Bars; query `start`, `end`, `adjusted=true` |
+| POST | `/ingestion/runs` | Ingest `{symbols, start, end, source}`; returns run summary |
+| GET | `/ingestion/runs` | Recent runs |
+| GET | `/ingestion/runs/{id}` | Run detail incl. data-quality issues |
+
+### Analytics
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/analytics/performance` | `symbols`, `start`, `end`, `risk_free` → total return, CAGR, ann. vol, Sharpe, Sortino, max drawdown, Calmar per symbol |
+| GET | `/analytics/returns` | Return series (`frequency=daily|weekly|monthly`, `cumulative=bool`) |
+| GET | `/analytics/drawdown/{symbol}` | Drawdown series + worst episodes |
+| GET | `/analytics/rolling` | Rolling vol / Sharpe (`window`) |
+| GET | `/analytics/correlation` | Correlation matrix (`method=pearson|spearman`) |
+
+### Portfolios
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/portfolios/construct` | Compute weights for `{symbols, method, lookback, constraints}`; not saved |
+| POST | `/portfolios` | Save a portfolio (manual or constructed weights) |
+| GET | `/portfolios` / `/portfolios/{id}` | List / detail |
+| DELETE | `/portfolios/{id}` | Remove |
+| GET | `/portfolios/{id}/risk` | Vol, VaR/CVaR (historical), beta vs benchmark, risk contribution per asset |
+
+### Strategies & backtests
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/strategies` | Available strategies + JSON schema of their parameters |
+| POST | `/backtests` | Run `{strategy, params, symbols, benchmark, start, end, initial_capital, cost_bps, slippage_bps}`; persisted, returns id + metrics |
+| GET | `/backtests` | List past runs (compare experiments) |
+| GET | `/backtests/{id}` | Run detail + metrics + benchmark comparison |
+| GET | `/backtests/{id}/equity` | Equity, benchmark and drawdown curves |
+| GET | `/backtests/{id}/trades` | Trade log |
+
+Backtests run **synchronously** in the MVP: daily data on tens of symbols over 10 to 20 years takes well under a second vectorised. A job queue is listed as a stretch goal, not built.
+
+---
+
+## 5. Quant methodology (summary; full version goes in `METHODOLOGY.md`)
+
+- **Returns:** simple returns from `adj_close`; log returns where additivity is needed.
+- **Annualisation:** 252 trading days. Vol = std(daily) × √252. Sharpe = mean(excess daily) / std(daily) × √252, risk-free rate as an annual input converted to daily.
+- **Max drawdown:** min of `equity / equity.cummax() − 1`.
+- **Portfolio construction:** equal weight; inverse volatility; minimum variance and maximum Sharpe via SLSQP with long-only, fully-invested, optional per-asset cap. Covariance from a trailing window, with optional Ledoit-Wolf-style shrinkage as a stretch.
+- **Momentum:** rank by trailing 12-1 month return (skip last month), hold top-N equal weight, monthly rebalance. Time-series variant: long if trailing return > 0.
+- **Mean reversion:** z-score of price vs rolling mean; enter when z < −k, exit when z crosses 0. Optional ADF test (Statsmodels) reported as a diagnostic.
+- **Benchmark comparison:** excess return, tracking error, information ratio, OLS alpha/beta (Statsmodels).
+
+### 5.1 No look-ahead bias: how it is enforced
+
+1. Strategies receive prices and return **target weights indexed by the date the signal was formed** (using data up to and including close *t*).
+2. The engine **shifts weights by one bar**: weights decided at close *t* earn the return from *t* to *t+1*. This lives in exactly one place (`engine.py`) so no strategy can bypass it.
+3. Rolling windows use only trailing data (`rolling(...)` with no `center=True`; no `bfill`).
+4. Portfolio optimisation inside a backtest uses only the trailing covariance window at each rebalance date.
+5. **Test that proves it:** a "future perturbation" test randomises all prices after date *T* and asserts every weight and equity value up to *T* is unchanged. Run for every strategy.
+
+### 5.2 Costs and slippage
+
+- Turnover at each rebalance = Σ|w_new − w_drifted|.
+- Commission cost = turnover × `cost_bps` / 10 000.
+- Slippage cost = turnover × `slippage_bps` / 10 000 (fixed-bps model in MVP; volume-based model is a stretch).
+- Costs are deducted from equity on the rebalance bar. A test checks that a zero-cost run matches the analytical gross return, and that costs scale linearly with turnover.
+
+---
+
+## 6. Milestones
+
+Each milestone ends with: code, explanation, exact commands, tests passing, and your sign-off before the next one.
+
+| # | Milestone | Deliverables | "Done" means |
+|---|---|---|---|
+| **1** | **Foundation + data pipeline** | Repo scaffold, `pyproject.toml`, config, logging, Docker Compose Postgres, SQLAlchemy models, first Alembic migration, `MarketDataSource` + yfinance/Stooq/CSV adapters, validation rules, idempotent upsert, ingestion audit, `fincomb ingest` CLI | `docker compose up db` + `fincomb ingest AAPL MSFT SPY --start 2015-01-01` fills Postgres; re-running inserts no duplicates; unit tests for validation, integration test for upsert |
+| 2 | Analytics core | `returns.py`, `risk.py`, `correlation.py` as pure functions | Metrics match hand-computed fixtures and known values; property tests (e.g. MDD ∈ [−1, 0]) |
+| 3 | FastAPI backend | App factory, error handling, routers for health/instruments/prices/ingestion/analytics, Pydantic schemas | OpenAPI docs live; integration tests via `TestClient` against test Postgres |
+| 4 | Portfolio construction & risk | Weight methods, risk metrics, portfolio endpoints | Weights sum to 1, respect bounds; min-var ≤ equal-weight variance on fixture data |
+| 5 | Strategies + backtest engine | Strategy ABC, momentum, mean reversion, buy-and-hold, engine with costs/slippage, benchmark report, persisted runs, backtest endpoints | Look-ahead perturbation test passes; buy-and-hold matches benchmark return exactly with zero costs |
+| 6 | Streamlit dashboard | Pages: Market data, Performance, Correlation heatmap, Portfolio builder, Backtest lab | Runs in Docker against the API; no direct DB access |
+| 7 | Polish for portfolio | Full Docker Compose, GitHub Actions CI (ruff, mypy, pytest + Postgres service), README with screenshots, METHODOLOGY.md, seed script, coverage badge | Fresh clone → `docker compose up` → working demo in one command |
+
+Stretch (only if time allows): async job queue for long backtests, walk-forward / parameter sweep with out-of-sample split, volume-based slippage, factor exposures, auth on write endpoints.
+
+---
+
+## 7. Technical risks and mitigations
+
+| Risk | Impact | Mitigation |
+|---|---|---|
+| **yfinance is unofficial and breaks / rate-limits** | Ingestion fails, demos break | Adapter interface + Stooq fallback; retry with backoff; checked-in CSV fixtures so tests and demos never need the network |
+| **Look-ahead bias** | Backtests look unrealistically good, which reviewers will spot | Single shift point in engine; perturbation test per strategy; documented in METHODOLOGY.md |
+| **Survivorship bias** | Universe of today's tickers overstates past returns | Acknowledge explicitly in docs; let users pick universes; delisted-data is out of scope for a free source |
+| **Adjusted vs raw prices** | Splits/dividends distort returns | Store both; analytics use `adj_close`; validation flags >40% one-day moves for review |
+| **Misaligned calendars** (ETFs vs stocks, holidays, missing bars) | Wrong correlations, NaN propagation | Align on inner-joined trading dates; explicit, documented missing-data policy (no forward-fill beyond N days) |
+| **Metric convention ambiguity** (252 vs 365, arithmetic vs geometric) | Numbers differ from other tools, credibility hit | One constants module; conventions written down; tests against known reference values |
+| **Optimiser instability** (singular covariance, non-convergence) | Bad or crashing weights | Minimum history check, small ridge term on covariance, fall back to inverse-vol with a logged warning |
+| **Overfitting / data snooping** | Strategy results not meaningful | Report in-sample vs out-of-sample split (stretch: walk-forward); keep strategies simple |
+| **Flaky integration tests** | CI noise | Tests use fixture CSVs; Postgres via Compose service in CI; each test in a rolled-back transaction |
+| **Docker friction on your machine** (Windows/Apple Silicon) | Setup time | Multi-arch slim images; app also runs locally against Dockerised Postgres only |
+| **Scope creep** | Nothing finished | Milestone gates; stretch list kept separate |
+
+---
