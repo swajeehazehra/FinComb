@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- FinComb additions ---
+.ruff_cache/
+.vscode/
+.idea/
+.DS_Store
