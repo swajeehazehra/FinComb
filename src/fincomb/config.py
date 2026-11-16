@@ -28,7 +28,8 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_json: bool = False
 
-    default_data_source: Literal["yfinance", "stooq", "csv"] = "yfinance"
+    default_data_source: Literal["yfinance", "tiingo", "csv"] = "yfinance"
+    tiingo_api_key: SecretStr | None = None  # only needed for --source tiingo
     csv_data_dir: Path = Path("tests/fixtures")
 
     # Data-quality thresholds

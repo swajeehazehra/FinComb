@@ -152,3 +152,29 @@ def test_coverage(session_factory, fixtures_dir):
     assert [(c.symbol, c.bars, c.first_date, c.last_date) for c in cov] == [
         ("SYNA", 260, date(2023, 1, 2), date(2023, 12, 29))
     ]
+
+
+def test_new_symbols_default_to_stock_and_explicit_type_corrects_them(
+    session_factory, fixtures_dir
+):
+    src = CsvSource(fixtures_dir)
+    run_ingestion(session_factory, src, ["SYNM"], START, END)
+    with session_scope(session_factory) as s:
+        assert InstrumentRepository(s).get_by_symbol("SYNM").asset_type is AssetType.STOCK
+
+    run_ingestion(session_factory, src, ["SYNM"], START, END, asset_type=AssetType.ETF)
+    with session_scope(session_factory) as s:
+        assert InstrumentRepository(s).get_by_symbol("SYNM").asset_type is AssetType.ETF
+
+    # Re-ingesting without --asset-type keeps the corrected label.
+    run_ingestion(session_factory, src, ["SYNM"], START, END)
+    with session_scope(session_factory) as s:
+        assert InstrumentRepository(s).get_by_symbol("SYNM").asset_type is AssetType.ETF
+
+
+def test_set_asset_type(session_factory, fixtures_dir):
+    run_ingestion(session_factory, CsvSource(fixtures_dir), ["SYNA"], START, END)
+    with session_scope(session_factory) as s:
+        repo = InstrumentRepository(s)
+        assert repo.set_asset_type("syna", AssetType.INDEX).asset_type is AssetType.INDEX
+        assert repo.set_asset_type("MISSING", AssetType.ETF) is None

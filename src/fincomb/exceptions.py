@@ -13,5 +13,9 @@ class SymbolNotFoundError(DataSourceError):
     """The source has no data for the requested symbol and date range."""
 
 
+class DataSourceAuthError(DataSourceError):
+    """Missing or invalid API credentials for a data source (retrying won't help)."""
+
+
 class ValidationError(FinCombError):
     """Input data failed validation."""

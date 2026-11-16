@@ -12,7 +12,7 @@ daily prices, checks them, and stores them.
           ▼
  ┌──────────────────┐   fetch_daily()   ┌──────────────────────────────┐
  │ MarketDataSource │ ────────────────▶ │ normalise(): one standard    │
- │ yfinance / stooq │                   │ frame for every provider     │
+ │ yfinance / tiingo│                   │ frame for every provider     │
  │ / csv            │                   └──────────────┬───────────────┘
  └──────────────────┘                                  ▼
                                          ┌──────────────────────────────┐
@@ -40,11 +40,11 @@ daily prices, checks them, and stores them.
 | `db/repositories.py` | All SQL lives here. `upsert_bars` uses `INSERT … ON CONFLICT (instrument_id, bar_date) DO UPDATE`, so ingesting the same data twice changes nothing. It also reports inserted vs updated counts using Postgres's `xmax = 0` trick, and splits big batches into chunks of 1,000 rows to stay under Postgres's 65,535-parameter limit. |
 | `ingestion/base.py` | The `MarketDataSource` abstract class. Each adapter only implements `_fetch_raw`; the base class normalises column names, time zones, sort order and dtypes, and filters to the requested dates. `with_retries` adds exponential backoff (but never retries "symbol not found"). |
 | `ingestion/yfinance_source.py` | Yahoo via `yfinance`, with `auto_adjust=False` so both raw OHLC and adjusted close are stored. yfinance's `end` is exclusive, so one day is added to make our ranges inclusive. |
-| `ingestion/stooq_source.py` | Fallback. Fetches Stooq's CSV directly. Stooq prices are already adjusted, so `adj_close = close` for this source. The HTTP function is injectable so tests never use the network. |
+| `ingestion/tiingo_source.py` | Fallback. Tiingo's official end-of-day API (free plan, needs a token in `TIINGO_API_KEY`). Stores raw OHLC and Tiingo's adjusted close. The token goes in the `Authorization` header, never the URL, so it can't leak into logs. A missing or rejected token fails immediately with instructions instead of retrying. |
 | `ingestion/csv_source.py` | Reads `SYMBOL.csv` from a folder. Used by tests and for offline demos. |
 | `validation/rules.py` | Pure function: takes a frame, returns `clean` rows plus a list of `Issue`s. Errors reject the row; warnings keep it but record it. |
 | `ingestion/pipeline.py` | Orchestrates one run. Each symbol gets its own transaction, so one bad ticker doesn't lose the others. The run ends as `success`, `partial` or `failed`. |
-| `cli.py` | The `fincomb` command: `check-db`, `ingest`, `coverage`, `show`. |
+| `cli.py` | The `fincomb` command: `check-db`, `ingest`, `coverage`, `show`, `set-type`. |
 | `migrations/` | Alembic. `0001_market_data` creates the schema. The DB URL comes from `.env`, not `alembic.ini`. |
 
 ### Validation rules
@@ -210,7 +210,7 @@ Schema revision: 0001_market_data
 ```bash
 pytest
 ```
-Expected: `41 passed`. If you see `30 passed, 11 skipped`, the integration tests
+Expected: `50 passed`. If you see `37 passed, 13 skipped`, the integration tests
 could not reach the test database (see troubleshooting below).
 
 With a coverage report:
@@ -230,9 +230,24 @@ fincomb show SPY --tail 5
 Run the first command again: you should see `0 inserted` and roughly 2,500
 `updated` per symbol, which proves ingestion is idempotent.
 
+New symbols are stored as `stock`. Passing `--asset-type` also corrects symbols
+already stored, or you can fix one directly:
+```bash
+fincomb set-type SPY etf
+```
+
+**Fallback source (Tiingo).** Yahoo is unofficial and sometimes rate-limits, so
+there is a second source with an official API. It needs a free token:
+
+1. Sign up at https://www.tiingo.com (free, no card).
+2. Copy your token from https://www.tiingo.com/account/api/token.
+3. In `.env`, set `TIINGO_API_KEY=your-token` (no quotes, no spaces).
+
+Free-plan limits: 50 requests/hour, 1,000/day, 500 different symbols/month.
+
 Try the fallback source and the offline demo data:
 ```bash
-fincomb ingest AAPL --start 2024-01-01 --source stooq
+fincomb ingest AAPL --start 2024-01-01 --source tiingo
 fincomb ingest SYNA SYNB SYNM BADDATA --source csv --start 2023-01-01 --end 2023-12-31
 ```
 `BADDATA` is a deliberately broken file: the run shows rows rejected and warnings.
@@ -266,7 +281,10 @@ docker compose down -v     # stop AND delete all stored data
 | `password authentication failed` | You changed the password in `.env` after the DB was first created. Either put the old password back, or reset with `docker compose down -v` and `docker compose up -d db`. |
 | `port is already allocated` / `address already in use` on 5432 | Another Postgres is running. Set `POSTGRES_PORT=5433` in `.env` and rerun `docker compose up -d db`. |
 | Integration tests are **skipped** with `database "fincomb_test" does not exist` | The test DB is only created when the volume is first made. Run `docker compose exec db createdb -U fincomb fincomb_test`. |
-| `yfinance returned no data for …` | Wrong ticker, no internet, or Yahoo is rate-limiting. Wait a minute, or use `--source stooq`. |
+| `yfinance returned no data for …` | Wrong ticker, no internet, or Yahoo is rate-limiting. Wait a minute, or use `--source tiingo`. |
+| `TIINGO_API_KEY is not set` / `Tiingo rejected the API token` | Follow the Tiingo steps in 4.7. The key must be on its own line in `.env` as `TIINGO_API_KEY=abc123`. |
+| `Tiingo rate limit reached` | The free plan allows 50 requests an hour. Wait, or use the default `yfinance` source. |
+| A symbol shows the wrong type in `fincomb coverage` | `fincomb set-type SPY etf` |
 | Windows: `running scripts is disabled on this system` | Run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once. |
 | Windows: `docker/initdb/...sh: not found` in `docker compose logs db` | The script got Windows line endings. The repo's `.gitattributes` prevents this on a fresh clone; if it happened, delete the folder, clone it again, then run `docker compose down -v` and `docker compose up -d db`. |
 

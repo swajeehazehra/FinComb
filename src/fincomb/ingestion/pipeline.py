@@ -63,7 +63,7 @@ def run_ingestion(
     start: date,
     end: date,
     *,
-    asset_type: AssetType = AssetType.STOCK,
+    asset_type: AssetType | None = None,
     extreme_return_threshold: float = 0.40,
     stale_price_run: int = 5,
 ) -> IngestionSummary:

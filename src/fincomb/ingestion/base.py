@@ -18,7 +18,7 @@ from typing import TypeVar
 
 import pandas as pd
 
-from fincomb.exceptions import DataSourceError, SymbolNotFoundError
+from fincomb.exceptions import DataSourceAuthError, DataSourceError, SymbolNotFoundError
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +100,7 @@ def with_retries(
     for attempt in range(1, attempts + 1):
         try:
             return fn()
-        except SymbolNotFoundError:
+        except (SymbolNotFoundError, DataSourceAuthError):
             raise  # retrying won't help
         except Exception as exc:  # noqa: BLE001 - provider libraries raise anything
             last = exc

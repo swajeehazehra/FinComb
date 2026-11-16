@@ -13,7 +13,7 @@ SciPy / Statsmodels · Plotly · Streamlit · Pytest · Docker
 
 ## What works today
 
-- Download daily OHLCV bars from **Yahoo Finance** (default) or **Stooq** (fallback),
+- Download daily OHLCV bars from **Yahoo Finance** (default) or **Tiingo** (fallback, free API key),
   or load them from CSV files, all through one pluggable `MarketDataSource` interface.
 - **Data-quality validation**: missing values, non-positive prices, inconsistent
   OHLC, negative volume, duplicate and future dates are rejected; extreme moves and
@@ -51,7 +51,7 @@ src/fincomb/
   config.py            settings from env vars / .env
   logging_config.py    plain or JSON logs
   db/                  SQLAlchemy models, engine, repositories (all SQL lives here)
-  ingestion/           MarketDataSource + yfinance, stooq, csv adapters, pipeline
+  ingestion/           MarketDataSource + yfinance, tiingo, csv adapters, pipeline
   validation/          data-quality rules
   cli.py               `fincomb` command
 migrations/            Alembic schema migrations
@@ -75,8 +75,8 @@ Full design: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Data sources and disclaimer
 
-Yahoo Finance data is accessed through the unofficial `yfinance` library and Stooq
-through its public CSV endpoint. Both are free and meant for personal research and
+Yahoo Finance data is accessed through the unofficial `yfinance` library and Tiingo
+through its official API on the free plan. Both are meant for personal research and
 education; check their terms before any other use. Nothing in this project is
 investment advice.
 

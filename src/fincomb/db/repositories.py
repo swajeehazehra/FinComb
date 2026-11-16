@@ -39,13 +39,26 @@ class InstrumentRepository:
     def get_by_symbol(self, symbol: str) -> Instrument | None:
         return self.session.scalar(select(Instrument).where(Instrument.symbol == symbol.upper()))
 
-    def get_or_create(self, symbol: str, asset_type: AssetType = AssetType.STOCK) -> Instrument:
+    def get_or_create(self, symbol: str, asset_type: AssetType | None = None) -> Instrument:
+        """Return the instrument, creating it if needed.
+
+        A new instrument defaults to "stock". If asset_type is given explicitly,
+        an existing instrument is updated to it (so a wrong label can be fixed).
+        """
         existing = self.get_by_symbol(symbol)
         if existing is not None:
+            if asset_type is not None and existing.asset_type is not asset_type:
+                existing.asset_type = asset_type
             return existing
-        instrument = Instrument(symbol=symbol.upper(), asset_type=asset_type)
+        instrument = Instrument(symbol=symbol.upper(), asset_type=asset_type or AssetType.STOCK)
         self.session.add(instrument)
         self.session.flush()  # assigns instrument.id
+        return instrument
+
+    def set_asset_type(self, symbol: str, asset_type: AssetType) -> Instrument | None:
+        instrument = self.get_by_symbol(symbol)
+        if instrument is not None:
+            instrument.asset_type = asset_type
         return instrument
 
     def coverage(self) -> list[Coverage]:

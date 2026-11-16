@@ -74,8 +74,12 @@ def ingest(
     end: Annotated[str | None, typer.Option(help="YYYY-MM-DD, default today")] = None,
     source: Annotated[str | None, typer.Option(help=f"One of {SOURCES}")] = None,
     asset_type: Annotated[
-        AssetType, typer.Option(help="Used when a symbol is new")
-    ] = AssetType.STOCK,
+        AssetType | None,
+        typer.Option(
+            help="stock, etf or index. New symbols default to stock; "
+            "passing it also corrects symbols already stored."
+        ),
+    ] = None,
 ) -> None:
     """Download daily bars, validate them and store them in Postgres."""
     settings, factory = _session_factory()
@@ -105,6 +109,21 @@ def ingest(
             )
     if summary.status is not RunStatus.SUCCESS:
         raise typer.Exit(1)
+
+
+@app.command("set-type")
+def set_type(
+    symbol: str,
+    asset_type: Annotated[AssetType, typer.Argument(help="stock, etf or index")],
+) -> None:
+    """Change the asset type of a stored symbol, e.g. `fincomb set-type SPY etf`."""
+    _, factory = _session_factory()
+    with session_scope(factory) as s:
+        instrument = InstrumentRepository(s).set_asset_type(symbol, asset_type)
+    if instrument is None:
+        typer.secho(f"{symbol.upper()} is not stored yet.", fg="red", err=True)
+        raise typer.Exit(1)
+    typer.echo(f"{symbol.upper()} is now {asset_type.value}.")
 
 
 @app.command()

@@ -35,7 +35,7 @@ class YFinanceSource(MarketDataSource):
                 # yfinance logs errors instead of raising; treat empty as "not found".
                 raise SymbolNotFoundError(
                     f"yfinance returned no data for {symbol} (unknown ticker, no "
-                    "internet, or Yahoo rate limit; try again later or use --source stooq)"
+                    "internet, or Yahoo rate limit; try again later or use --source tiingo)"
                 )
             return df
 
