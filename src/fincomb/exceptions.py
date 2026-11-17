@@ -17,5 +17,9 @@ class DataSourceAuthError(DataSourceError):
     """Missing or invalid API credentials for a data source (retrying won't help)."""
 
 
+class DataOwnershipError(FinCombError):
+    """A symbol's stored history comes from a different (or several) data source(s)."""
+
+
 class ValidationError(FinCombError):
     """Input data failed validation."""

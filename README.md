@@ -22,6 +22,11 @@ SciPy / Statsmodels · Plotly · Streamlit · Pytest · Docker
   never duplicates them. Database CHECK constraints are a second line of defence.
 - A full **audit trail**: every run records which symbols succeeded or failed and
   every data-quality issue it found.
+- **Consistent history** ([docs/DATA_INTEGRITY.md](docs/DATA_INTEGRITY.md)): each
+  symbol is owned by one data source, unfinished intraday bars are never stored,
+  and a vendor re-adjustment (dividend/split) triggers a full re-download instead
+  of a stitched history. `fincomb check-data` audits it and `fincomb refresh`
+  repairs it.
 - Schema managed with **Alembic** migrations; config from environment variables only.
 
 ## Quick start

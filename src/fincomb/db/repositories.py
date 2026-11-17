@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import date
 
 import pandas as pd
-from sqlalchemy import func, literal_column, select
+from sqlalchemy import delete, func, literal_column, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -60,6 +60,9 @@ class InstrumentRepository:
         if instrument is not None:
             instrument.asset_type = asset_type
         return instrument
+
+    def all_symbols(self) -> list[str]:
+        return list(self.session.scalars(select(Instrument.symbol).order_by(Instrument.symbol)))
 
     def coverage(self) -> list[Coverage]:
         stmt = (
@@ -129,6 +132,47 @@ class PriceRepository:
             inserted += n_new
             updated += len(flags) - n_new
         return UpsertResult(inserted=inserted, updated=updated)
+
+    def stored_range(self, instrument_id: int) -> tuple[date | None, date | None, int]:
+        """(first date, last date, number of bars) stored for an instrument."""
+        first, last, n = self.session.execute(
+            select(func.min(PriceBar.bar_date), func.max(PriceBar.bar_date), func.count()).where(
+                PriceBar.instrument_id == instrument_id
+            )
+        ).one()
+        return first, last, n
+
+    def sources(self, instrument_id: int) -> set[str]:
+        """Distinct data sources found in an instrument's stored bars."""
+        return set(
+            self.session.scalars(
+                select(PriceBar.source).where(PriceBar.instrument_id == instrument_id).distinct()
+            )
+        )
+
+    def bars_for_instrument(
+        self, instrument_id: int, start: date | None = None, end: date | None = None
+    ) -> pd.DataFrame:
+        """Stored bars indexed by date (same shape as a data source's frame)."""
+        stmt = select(PriceBar.bar_date, *[getattr(PriceBar, c) for c in PRICE_COLUMNS]).where(
+            PriceBar.instrument_id == instrument_id
+        )
+        if start:
+            stmt = stmt.where(PriceBar.bar_date >= start)
+        if end:
+            stmt = stmt.where(PriceBar.bar_date <= end)
+        rows = self.session.execute(stmt.order_by(PriceBar.bar_date)).all()
+        df = pd.DataFrame(rows, columns=["date", *PRICE_COLUMNS])
+        df["date"] = pd.to_datetime(df["date"]).dt.as_unit("ns")
+        df[PRICE_COLUMNS] = df[PRICE_COLUMNS].astype("float64")
+        return df.set_index("date")
+
+    def delete_bars(self, instrument_id: int) -> int:
+        """Delete every stored bar of an instrument (used when replacing its history)."""
+        result = self.session.execute(
+            delete(PriceBar).where(PriceBar.instrument_id == instrument_id)
+        )
+        return result.rowcount or 0
 
     def get_bars(
         self, symbol: str, start: date | None = None, end: date | None = None
