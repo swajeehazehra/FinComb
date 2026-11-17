@@ -13,7 +13,8 @@ from fincomb.db.base import Base
 
 config = context.config
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # Keep application loggers working when migrations run in-process (e.g. in tests).
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 # Tests pass an explicit URL via `config.attributes["url"]`.
 url = config.attributes.get("url") or get_settings().database_url()
