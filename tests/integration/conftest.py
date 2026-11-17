@@ -20,6 +20,13 @@ from fincomb.db.base import make_engine, make_session_factory
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def alembic_config(url) -> Config:
+    cfg = Config(str(ROOT / "alembic.ini"))
+    cfg.set_main_option("script_location", str(ROOT / "migrations"))
+    cfg.attributes["url"] = url
+    return cfg
+
+
 @pytest.fixture(scope="session")
 def engine():
     url = get_settings().database_url(test=True)
@@ -32,9 +39,7 @@ def engine():
             f"test database not reachable ({exc.orig}); start it with `docker compose up -d db`"
         )
 
-    cfg = Config(str(ROOT / "alembic.ini"))
-    cfg.set_main_option("script_location", str(ROOT / "migrations"))
-    cfg.attributes["url"] = url
+    cfg = alembic_config(url)
     command.downgrade(cfg, "base")  # start from an empty schema every session
     command.upgrade(cfg, "head")
     yield eng

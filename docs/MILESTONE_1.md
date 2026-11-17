@@ -44,8 +44,9 @@ daily prices, checks them, and stores them.
 | `ingestion/csv_source.py` | Reads `SYMBOL.csv` from a folder. Used by tests and for offline demos. |
 | `validation/rules.py` | Pure function: takes a frame, returns `clean` rows plus a list of `Issue`s. Errors reject the row; warnings keep it but record it. |
 | `ingestion/pipeline.py` | Orchestrates one run. Each symbol gets its own transaction, so one bad ticker doesn't lose the others. The run ends as `success`, `partial` or `failed`. |
-| `cli.py` | The `fincomb` command: `check-db`, `ingest`, `coverage`, `show`, `set-type`. |
-| `migrations/` | Alembic. `0001_market_data` creates the schema. The DB URL comes from `.env`, not `alembic.ini`. |
+| `cli.py` | The `fincomb` command: `check-db`, `ingest`, `coverage`, `show`, `set-type`, plus `check-data` and `refresh` (see [DATA_INTEGRITY.md](DATA_INTEGRITY.md)). |
+| `migrations/` | Alembic. `0001_market_data` creates the schema; `0002_instrument_data_source` records which source owns each symbol. The DB URL comes from `.env`, not `alembic.ini`. |
+| `ingestion/calendar.py`, `ingestion/audit.py` | The last completed trading session (so unfinished bars are never stored) and the `check-data` audit. See [DATA_INTEGRITY.md](DATA_INTEGRITY.md). |
 
 ### Validation rules
 
@@ -202,7 +203,7 @@ fincomb check-db
 Expected:
 ```
 Connected: PostgreSQL 16.x ...
-Schema revision: 0001_market_data
+Schema revision: 0002_instrument_data_source
 ```
 
 ### 4.6 Run the tests
@@ -210,7 +211,7 @@ Schema revision: 0001_market_data
 ```bash
 pytest
 ```
-Expected: `50 passed`. If you see `37 passed, 13 skipped`, the integration tests
+Expected: `72 passed`. If you see `45 passed, 27 skipped`, the integration tests
 could not reach the test database (see troubleshooting below).
 
 With a coverage report:

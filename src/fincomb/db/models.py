@@ -62,6 +62,9 @@ class Instrument(Base):
     exchange: Mapped[str | None] = mapped_column(String(20))
     currency: Mapped[str] = mapped_column(String(3), nullable=False, default="USD")
     is_active: Mapped[bool] = mapped_column(nullable=False, default=True)
+    # The one source this symbol's price history comes from ("yfinance", "tiingo",
+    # "csv"). Mixing sources breaks the history: vendors adjust prices differently.
+    data_source: Mapped[str | None] = mapped_column(String(20))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
