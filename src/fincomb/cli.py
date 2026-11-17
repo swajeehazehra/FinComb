@@ -203,8 +203,7 @@ def analyze(
     """Return, volatility, Sharpe, Sortino and drawdown for each symbol."""
     prices = _load(symbols, start, end, align)
     table = performance_summary(prices, risk_free=risk_free)
-    outer = align == "outer"
-    if outer:
+    if align == "outer":
         typer.echo(f"\nEach symbol over its own history, risk-free {risk_free:.2%}\n")
     else:
         typer.echo(
@@ -213,19 +212,29 @@ def analyze(
             f"risk-free {risk_free:.2%}\n"
         )
     header = (
-        f"{'symbol':<8}{'from' if outer else '':>{12 if outer else 0}}"
+        f"{'symbol':<8}{'from':>12}{'to':>12}"
         f"{'total':>10}{'CAGR':>9}{'vol':>9}{'sharpe':>8}"
         f"{'sortino':>9}{'max DD':>10}{'calmar':>8}"
     )
     typer.echo(header)
     typer.echo("-" * len(header))
     for sym, r in table.iterrows():
-        since = f"{str(r.start):>12}" if outer else ""
         typer.echo(
-            f"{sym:<8}{since}{_pct(r.total_return):>10}{_pct(r.cagr):>9}"
+            f"{sym:<8}{str(r.start):>12}{str(r.end):>12}"
+            f"{_pct(r.total_return):>10}{_pct(r.cagr):>9}"
             f"{_pct(r.annual_volatility):>9}{_num(r.sharpe):>8}{_num(r.sortino):>9}"
             f"{_pct(r.max_drawdown):>10}{_num(r.calmar):>8}"
         )
+    _print_alignment_notes(prices)
+
+
+def _print_alignment_notes(prices) -> None:
+    """Show, next to the results, why inner alignment shortened the period."""
+    notes = prices.attrs.get("alignment_notes", [])
+    if notes:
+        typer.echo("")
+    for note in notes:
+        typer.secho(f"Note: {note}", fg="yellow")
 
 
 @app.command()
@@ -254,6 +263,7 @@ def correlation(
         raise typer.Exit(1) from exc
     typer.echo(f"\n{method.title()} correlation of daily returns\n")
     typer.echo(corr.round(2).to_string())
+    _print_alignment_notes(prices)
 
 
 @app.command()

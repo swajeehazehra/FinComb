@@ -122,3 +122,70 @@ def test_cli_correlation_outer(cli_on_test_db, loaded):
     _add_short_symbol(loaded, n=30)
     res = cli_on_test_db.invoke(app, ["correlation", "SYNA", "SYNB", "SHORT", "--align", "outer"])
     assert res.exit_code == 0, res.output
+
+
+def _add_stale_symbol(factory):
+    """STALE trades all year but its data stops two sessions before SYNA/SYNB."""
+    idx = pd.bdate_range("2023-01-02", "2023-12-27", name="date")
+    df = pd.DataFrame(
+        {"open": 10.0, "high": 11.0, "low": 9.0, "close": 10.0, "adj_close": 10.0, "volume": 1.0},
+        index=idx,
+    )
+    with session_scope(factory) as s:
+        inst = InstrumentRepository(s).get_or_create("STALE")
+        PriceRepository(s).upsert_bars(inst.id, df, "csv", None)
+
+
+def _row(output: str, symbol: str) -> list[str]:
+    return next(line.split() for line in output.splitlines() if line.startswith(symbol))
+
+
+STALE_NOTE = (
+    "Note: Common period ends 2023-12-27 because STALE has no data after then "
+    "(others run to 2023-12-29)."
+)
+
+
+def test_load_prices_keeps_alignment_notes(loaded):
+    _add_stale_symbol(loaded)
+    with session_scope(loaded) as s:
+        inner = load_prices(s, ["SYNA", "STALE"], START, END)
+        outer = load_prices(s, ["SYNA", "STALE"], START, END, align="outer")
+        same = load_prices(s, ["SYNA", "SYNB"], START, END)
+    assert inner.attrs["alignment_notes"] == [STALE_NOTE.removeprefix("Note: ")]
+    assert outer.attrs["alignment_notes"] == [] and same.attrs["alignment_notes"] == []
+
+
+def test_cli_analyze_outer_shows_each_symbols_own_end_date(cli_on_test_db, loaded):
+    _add_stale_symbol(loaded)
+    res = cli_on_test_db.invoke(app, ["analyze", "SYNA", "STALE", "--align", "outer"])
+    assert res.exit_code == 0, res.output
+    assert "from" in res.stdout and " to " in res.stdout
+    assert _row(res.stdout, "SYNA")[1:4] == ["2023-01-02", "2023-12-29", "-25.15%"]
+    assert _row(res.stdout, "STALE")[1:3] == ["2023-01-02", "2023-12-27"]
+    assert "Note:" not in res.stdout
+
+
+def test_cli_analyze_inner_shows_window_and_warns_on_stdout(cli_on_test_db, loaded):
+    _add_stale_symbol(loaded)
+    res = cli_on_test_db.invoke(app, ["analyze", "SYNA", "STALE"])
+    assert res.exit_code == 0, res.output
+    # every row is measured over the shortened common window...
+    assert _row(res.stdout, "SYNA")[1:4] == ["2023-01-02", "2023-12-27", "-25.47%"]
+    assert _row(res.stdout, "STALE")[1:3] == ["2023-01-02", "2023-12-27"]
+    # ...and the reason is printed with the results, not only in the log
+    assert STALE_NOTE in res.stdout
+
+
+def test_cli_analyze_inner_no_note_when_windows_match(cli_on_test_db):
+    res = cli_on_test_db.invoke(app, ["analyze", "SYNA", "SYNB"])
+    assert res.exit_code == 0, res.output
+    assert _row(res.stdout, "SYNA")[1:3] == ["2023-01-02", "2023-12-29"]
+    assert "Note:" not in res.stdout
+
+
+def test_cli_correlation_inner_warns_on_stdout(cli_on_test_db, loaded):
+    _add_stale_symbol(loaded)
+    res = cli_on_test_db.invoke(app, ["correlation", "SYNA", "SYNB", "STALE"])
+    assert res.exit_code == 0, res.output
+    assert STALE_NOTE in res.stdout

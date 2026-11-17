@@ -155,7 +155,8 @@ exit()
 | `No module named 'hypothesis'` when running `pytest` | Run `pip install -e ".[dev]"` again with `(.venv)` active. |
 | `no stored prices for XYZ … run fincomb ingest XYZ first` | Ingest the symbol, or check its spelling with `fincomb coverage`. |
 | `fewer than 2 common dates` | The symbols don't overlap in time. Check their date ranges with `fincomb coverage`, or widen `--start`/`--end`. |
-| `WARNING ... Common period starts ... because XYZ has no data before then` | Not an error: XYZ has a shorter history, so every symbol is measured from that date. Use `--align outer` to measure each from its own start. |
+| `Note: Common period starts ... because XYZ has no data before then` | Not an error: XYZ has a shorter history, so every symbol is measured from that date. Use `--align outer` to measure each from its own start. |
+| `Note: Common period ends ... because XYZ has no data after then (others run to ...)` | XYZ's data stops earlier (usually it just needs `fincomb ingest XYZ`), so every symbol is measured only to that date. That is why inner and `--align outer` totals can differ. The `from` and `to` columns show each symbol's exact window. |
 | `MissingDataError: ... missing return(s) inside the series` | A price is missing in the middle of a series you passed to a compounding function in Python. Align the data first, or pass `missing="zero"` if a flat day is what you want. |
 | A Sharpe or Sortino shows `n/a` | Zero volatility (or no losing days for Sortino) in that window, so the ratio is undefined. |
 | Numbers differ slightly from a website | Check the conventions in METHODOLOGY.md: risk-free rate, 252 days, adjusted prices and exact date range all change the result. |

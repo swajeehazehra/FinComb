@@ -16,7 +16,7 @@ are all written down here.
 | Risk-free rate | Input as an **annual** rate, converted by compounding to a daily rate | `risk.periodic_rate` |
 | Missing prices | Never filled. A gap gives a NaN return, not an invented one | `returns.simple_returns` |
 | Missing returns when compounding | **Error by default** (`missing="raise"`); `missing="zero"` treats a gap as a flat day only when asked | `returns.handle_missing` |
-| Several assets | Aligned on the dates **all** of them traded (inner join) by default, with a warning naming the symbol that limits the period; `--align outer` keeps each symbol's own history | `market_data.load_prices` |
+| Several assets | Aligned on the dates **all** of them traded (inner join) by default, with a note under the results naming the symbol that limits the start or end of the period, and `from`/`to` columns showing each symbol's exact window; `--align outer` keeps each symbol's own history | `market_data.load_prices` |
 | Resampled periods | Labelled with the **last actual trading day** in the period | `returns.resample_returns` |
 | Rolling windows | Trailing only, full window required (no partial or centred windows) | `risk.rolling_*` |
 

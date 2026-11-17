@@ -30,6 +30,10 @@ def load_prices(
     align="inner" (default) keeps only dates where every symbol has a price, so
     returns for different assets always cover the same periods. "outer" keeps all
     dates and leaves NaN gaps; nothing is ever forward-filled.
+
+    With inner alignment, the plain-English reasons the common period is shorter
+    than the full data (see `alignment_warnings`) are logged and also kept in
+    ``wide.attrs["alignment_notes"]``.
     """
     if field not in PRICE_COLUMNS:
         raise ValueError(f"field must be one of {PRICE_COLUMNS}")
@@ -49,9 +53,10 @@ def load_prices(
 
     wide = pd.concat(columns, axis=1, join=align).sort_index()
     wide.columns.name = "symbol"
-    if align == "inner":
-        for message in alignment_warnings(columns, wide):
-            logger.warning(message)
+    notes = alignment_warnings(columns, wide) if align == "inner" else []
+    for message in notes:
+        logger.warning(message)
+    wide.attrs["alignment_notes"] = notes  # shown to the user by the CLI
     if len(wide) < 2:
         raise InsufficientDataError("fewer than 2 common dates across the requested symbols")
     return wide
