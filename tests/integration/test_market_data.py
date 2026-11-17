@@ -2,6 +2,7 @@ from datetime import date
 
 import pandas as pd
 import pytest
+from sqlalchemy import text
 from typer.testing import CliRunner
 
 from fincomb.cli import app
@@ -42,13 +43,33 @@ def test_load_prices_wide_frame(loaded):
     assert not wide.isna().any().any()
 
 
-def test_load_prices_inner_vs_outer_alignment(loaded):
+def test_load_prices_inner_vs_outer_alignment(loaded, caplog):
     _add_short_symbol(loaded)
-    with session_scope(loaded) as s:
+    with session_scope(loaded) as s, caplog.at_level("WARNING"):
         inner = load_prices(s, ["SYNA", "SHORT"], START, END)
         outer = load_prices(s, ["SYNA", "SHORT"], START, END, align="outer")
     assert len(inner) == 5 and not inner.isna().any().any()
     assert len(outer) == 260 and outer["SHORT"].isna().sum() == 255  # never forward-filled
+    text = caplog.text
+    assert "starts 2023-06-01 because SHORT has no data before then" in text
+    assert "ends 2023-06-07 because SHORT" in text
+
+
+def test_load_prices_drops_a_date_missing_for_one_symbol(loaded, caplog):
+    with session_scope(loaded) as s:
+        s.execute(
+            text(
+                "DELETE FROM price_bars USING instruments WHERE "
+                "price_bars.instrument_id = instruments.id AND symbol = 'SYNB' "
+                "AND bar_date = '2023-03-15'"
+            )
+        )
+    with session_scope(loaded) as s, caplog.at_level("WARNING"):
+        inner = load_prices(s, ["SYNA", "SYNB"], START, END)
+        outer = load_prices(s, ["SYNA", "SYNB"], START, END, align="outer")
+    assert pd.Timestamp("2023-03-15") not in inner.index and len(inner) == 259
+    assert "1 date(s) inside the common period were dropped" in caplog.text
+    assert outer.loc["2023-03-15", "SYNB"] != outer.loc["2023-03-15", "SYNB"]  # NaN kept
 
 
 def test_load_prices_date_filter_and_field(loaded):
@@ -86,3 +107,18 @@ def test_cli_correlation_and_drawdowns(cli_on_test_db):
 def test_cli_unknown_symbol_exits_nonzero(cli_on_test_db):
     res = cli_on_test_db.invoke(app, ["analyze", "NOPE"])
     assert res.exit_code == 1
+
+
+def test_cli_analyze_outer_shows_each_symbols_start(cli_on_test_db, loaded):
+    _add_short_symbol(loaded, n=30)
+    res = cli_on_test_db.invoke(app, ["analyze", "SYNA", "SHORT", "--align", "outer"])
+    assert res.exit_code == 0, res.output
+    assert "own history" in res.output and "2023-06-01" in res.output
+    res = cli_on_test_db.invoke(app, ["analyze", "SYNA", "--align", "sideways"])
+    assert res.exit_code != 0
+
+
+def test_cli_correlation_outer(cli_on_test_db, loaded):
+    _add_short_symbol(loaded, n=30)
+    res = cli_on_test_db.invoke(app, ["correlation", "SYNA", "SYNB", "SHORT", "--align", "outer"])
+    assert res.exit_code == 0, res.output

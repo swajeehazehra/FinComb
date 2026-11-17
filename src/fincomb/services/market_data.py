@@ -50,14 +50,47 @@ def load_prices(
     wide = pd.concat(columns, axis=1, join=align).sort_index()
     wide.columns.name = "symbol"
     if align == "inner":
-        dropped = max(len(c) for c in columns.values()) - len(wide)
-        if dropped:
-            logger.info(
-                "aligned %d symbols on %d common dates (%d dates dropped)",
-                len(symbols),
-                len(wide),
-                dropped,
-            )
+        for message in alignment_warnings(columns, wide):
+            logger.warning(message)
     if len(wide) < 2:
         raise InsufficientDataError("fewer than 2 common dates across the requested symbols")
     return wide
+
+
+def alignment_warnings(columns: dict[str, pd.Series], aligned: pd.DataFrame) -> list[str]:
+    """Explain which symbol(s) shortened the common period, in plain words.
+
+    Example: "Common period starts 2021-03-01 because QQQM has no data before then
+    (other symbols start as early as 2015-01-02)."
+    """
+    if len(columns) < 2 or aligned.empty:
+        return []
+    msgs = []
+    firsts = {s: c.index.min() for s, c in columns.items()}
+    lasts = {s: c.index.max() for s, c in columns.items()}
+    earliest, latest = min(firsts.values()), max(lasts.values())
+    common_start, common_end = aligned.index.min(), aligned.index.max()
+    if common_start > earliest:
+        limiting = sorted(s for s, d in firsts.items() if d == max(firsts.values()))
+        msgs.append(
+            f"Common period starts {common_start.date()} because {', '.join(limiting)} "
+            f"has no data before then (other symbols start as early as {earliest.date()}). "
+            "Use --align outer to analyse each symbol over its own history."
+        )
+    if common_end < latest:
+        limiting = sorted(s for s, d in lasts.items() if d == min(lasts.values()))
+        msgs.append(
+            f"Common period ends {common_end.date()} because {', '.join(limiting)} "
+            f"has no data after then (others run to {latest.date()})."
+        )
+    in_window = {
+        sym: c.index[(c.index >= common_start) & (c.index <= common_end)]
+        for sym, c in columns.items()
+    }
+    dropped = max(len(idx.difference(aligned.index)) for idx in in_window.values())
+    if dropped:
+        msgs.append(
+            f"{dropped} date(s) inside the common period were dropped because at "
+            "least one symbol has no price on them."
+        )
+    return msgs

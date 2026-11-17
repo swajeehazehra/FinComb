@@ -6,6 +6,7 @@ import pytest
 
 from fincomb.analytics import risk
 from fincomb.analytics.returns import cagr, simple_returns
+from fincomb.exceptions import MissingDataError
 from fincomb.ingestion.csv_source import CsvSource
 
 SQRT252 = math.sqrt(252)
@@ -75,8 +76,16 @@ def test_drawdown_of_rising_series_is_zero():
 
 
 def test_calmar():
-    r = simple_returns(series([100, 120, 90, 130, 65]))
-    assert risk.calmar_ratio(r) == pytest.approx(cagr(r) / 0.5)
+    prices = series([100, 120, 90, 130, 65])
+    r = simple_returns(prices)
+    assert risk.calmar_ratio(r, start=prices.index[0]) == pytest.approx(
+        cagr(r, start=prices.index[0]) / 0.5
+    )
+
+
+def test_calmar_negative_when_cagr_negative_and_nan_without_drawdown():
+    assert risk.calmar_ratio(series([-0.1, 0.05])) < 0
+    assert np.isnan(risk.calmar_ratio(series([0.01, 0.02])))
 
 
 def test_drawdown_episodes():
@@ -149,3 +158,56 @@ def test_matches_independent_numpy_calculation(fixtures_dir):
     assert risk.max_drawdown(ours) == pytest.approx(
         (wealth / np.maximum.accumulate(wealth) - 1).min()
     )
+
+
+def test_sortino_with_risk_free_hand_computed():
+    r = series([0.02, -0.01, 0.03, -0.02, 0.0])
+    rf = risk.periodic_rate(0.04)
+    excess = [x - rf for x in [0.02, -0.01, 0.03, -0.02, 0.0]]
+    downside = math.sqrt(sum(min(e, 0) ** 2 for e in excess) / 5) * SQRT252
+    expected = (sum(excess) / 5) * 252 / downside
+    assert risk.sortino_ratio(r, risk_free=0.04) == pytest.approx(expected)
+
+
+def test_ratios_on_dataframe_match_per_column():
+    rng = np.random.default_rng(5)
+    df = pd.DataFrame(
+        rng.normal(0.0005, 0.01, (100, 3)),
+        columns=list("ABC"),
+        index=pd.bdate_range("2024-01-01", periods=100),
+    )
+    for fn in (
+        risk.sharpe_ratio,
+        risk.sortino_ratio,
+        risk.annualized_volatility,
+        risk.max_drawdown,
+    ):
+        together = fn(df)
+        for col in df.columns:
+            assert together[col] == pytest.approx(fn(df[col]))
+
+
+def test_drawdown_recovery_on_last_day():
+    prices = series([100, 110, 99, 110])
+    (ep,) = risk.drawdown_episodes(simple_returns(prices))
+    assert ep.recovery == prices.index[-1] and ep.days_to_recover == 1
+
+
+def test_back_to_back_drawdowns_are_separate_episodes():
+    prices = series([100, 90, 100, 95, 100])  # recover exactly, then fall again
+    eps = risk.drawdown_episodes(simple_returns(prices))
+    assert sorted(e.depth for e in eps) == pytest.approx([-0.10, -0.05])
+    assert all(e.recovery is not None for e in eps)
+
+
+def test_drawdown_trough_ties_pick_first_date():
+    prices = series([100, 80, 90, 80, 100])
+    (ep,) = risk.drawdown_episodes(simple_returns(prices))
+    assert ep.trough == prices.index[1] and ep.depth == pytest.approx(-0.2)
+
+
+def test_drawdown_gap_raises_unless_zero_policy():
+    r = series([0.1, np.nan, -0.2])
+    with pytest.raises(MissingDataError):
+        risk.max_drawdown(r)
+    assert risk.max_drawdown(r, missing="zero") == pytest.approx(-0.2)

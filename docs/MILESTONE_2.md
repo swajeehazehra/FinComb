@@ -28,12 +28,12 @@ terminal. Every formula and convention is written down in
 |---|---|
 | `analytics/constants.py` | `TRADING_DAYS = 252`, the one place the year length is defined. |
 | `analytics/_utils.py` | Input checks shared by every function: date index, sorted, no duplicates, positive prices, enough rows, no return of −100 % or worse. Bad input fails loudly instead of giving a wrong number. |
-| `analytics/returns.py` | Simple and log returns, wealth index, cumulative and total return, CAGR, and resampling daily returns to weekly/monthly/yearly by compounding. |
+| `analytics/returns.py` | Simple and log returns, wealth index, cumulative and total return, calendar-time CAGR, and resampling daily returns to weekly/monthly/yearly by compounding (labelled with the last trading day). Gaps inside a series raise an error instead of being treated as flat days. |
 | `analytics/risk.py` | Annualised volatility, Sharpe, Sortino, drawdown series, maximum drawdown, drawdown episodes (peak, trough, recovery, durations), Calmar, rolling volatility and rolling Sharpe. Division by a zero volatility returns NaN, never infinity. |
 | `analytics/correlation.py` | Pearson or Spearman correlation matrix of returns, and rolling correlation between two assets. |
 | `analytics/summary.py` | `performance_summary()`: one row of key statistics per symbol. |
-| `services/market_data.py` | `load_prices()`: reads stored bars and pivots them into a dates × symbols table. By default it keeps only dates where **every** symbol traded, so all statistics cover the same days. Gaps are never forward-filled. |
-| `cli.py` | New commands `analyze`, `correlation` and `drawdowns`. |
+| `services/market_data.py` | `load_prices()`: reads stored bars and pivots them into a dates × symbols table. By default it keeps only dates where **every** symbol traded, so all statistics cover the same days, and warns which symbol limits that period. `align="outer"` keeps every date instead. Gaps are never forward-filled. |
+| `cli.py` | New commands `analyze`, `correlation` (both with `--align inner/outer`) and `drawdowns`. |
 
 ### Design choices worth mentioning in interviews
 
@@ -76,7 +76,7 @@ No database migration is needed for this milestone: nothing new is stored.
 pytest
 ```
 
-Expected: **102 passed**. To see which lines are tested:
+Expected: **120 passed**. To see which lines are tested:
 
 ```powershell
 pytest --cov=fincomb --cov-report=term-missing
@@ -98,7 +98,13 @@ fincomb analyze AAPL MSFT NVDA JPM XOM SPY --start 2015-01-01 --risk-free 0.04
 ```
 
 You get total return, CAGR, volatility, Sharpe, Sortino, max drawdown and Calmar
-for each symbol over the same dates.
+for each symbol over the same dates. If one symbol has a shorter history, a
+warning names it and says where the common period starts. To analyse every
+symbol over its own full history instead:
+
+```powershell
+fincomb analyze AAPL SPY QQQ --align outer --risk-free 0.02
+```
 
 **Correlation of daily returns:**
 
@@ -149,6 +155,8 @@ exit()
 | `No module named 'hypothesis'` when running `pytest` | Run `pip install -e ".[dev]"` again with `(.venv)` active. |
 | `no stored prices for XYZ … run fincomb ingest XYZ first` | Ingest the symbol, or check its spelling with `fincomb coverage`. |
 | `fewer than 2 common dates` | The symbols don't overlap in time. Check their date ranges with `fincomb coverage`, or widen `--start`/`--end`. |
+| `WARNING ... Common period starts ... because XYZ has no data before then` | Not an error: XYZ has a shorter history, so every symbol is measured from that date. Use `--align outer` to measure each from its own start. |
+| `MissingDataError: ... missing return(s) inside the series` | A price is missing in the middle of a series you passed to a compounding function in Python. Align the data first, or pass `missing="zero"` if a flat day is what you want. |
 | A Sharpe or Sortino shows `n/a` | Zero volatility (or no losing days for Sortino) in that window, so the ratio is undefined. |
 | Numbers differ slightly from a website | Check the conventions in METHODOLOGY.md: risk-free rate, 252 days, adjusted prices and exact date range all change the result. |
 

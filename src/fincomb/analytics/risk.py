@@ -13,7 +13,7 @@ import pandas as pd
 
 from fincomb.analytics._utils import Frame, check_returns
 from fincomb.analytics.constants import TRADING_DAYS
-from fincomb.analytics.returns import cagr, wealth_index
+from fincomb.analytics.returns import Missing, cagr, wealth_index
 
 
 def periodic_rate(annual_rate: float, periods_per_year: int = TRADING_DAYS) -> float:
@@ -23,6 +23,7 @@ def periodic_rate(annual_rate: float, periods_per_year: int = TRADING_DAYS) -> f
 
 
 _ZERO = 1e-12  # below this a standard deviation is treated as zero (float noise)
+_DD_TOL = 1e-10  # drawdowns smaller than this are rounding noise
 
 
 def _safe_div(num, den):
@@ -60,24 +61,32 @@ def sortino_ratio(returns: Frame, risk_free: float = 0.0, periods_per_year: int 
     return _safe_div(excess_mean, downside_deviation(returns, rf, periods_per_year))
 
 
-def drawdown_series(returns: Frame) -> Frame:
+def drawdown_series(returns: Frame, missing: Missing = "raise") -> Frame:
     """Percentage below the running peak at each date (0 at a new high, negative otherwise).
 
     The starting capital counts as the first peak, so a loss on day one is a drawdown.
     """
-    wealth = wealth_index(returns)
+    wealth = wealth_index(returns, missing=missing)
     peak = wealth.cummax().clip(lower=1.0)
-    return wealth / peak - 1.0
+    dd = wealth / peak - 1.0
+    # Compounding rounding can leave a fully recovered value at -1e-16; that is a
+    # recovery, not a drawdown. Snap tiny values to exactly 0 (NaN stays NaN).
+    return dd.mask(dd.abs() < _DD_TOL, 0.0)
 
 
-def max_drawdown(returns: Frame):
+def max_drawdown(returns: Frame, missing: Missing = "raise"):
     """Worst peak-to-trough loss, as a negative number in [-1, 0]."""
-    return drawdown_series(returns).min()
+    return drawdown_series(returns, missing).min()
 
 
-def calmar_ratio(returns: Frame, periods_per_year: int = TRADING_DAYS):
-    """CAGR / |max drawdown|."""
-    return _safe_div(cagr(returns, periods_per_year), abs(max_drawdown(returns)))
+def calmar_ratio(
+    returns: Frame, start: pd.Timestamp | str | None = None, missing: Missing = "raise"
+):
+    """CAGR / |max drawdown|, both over the WHOLE period given (not a trailing 36 months).
+
+    `start` is the date of the starting price, as in `cagr`.
+    """
+    return _safe_div(cagr(returns, start, missing), abs(max_drawdown(returns, missing)))
 
 
 @dataclass(frozen=True)
@@ -90,11 +99,13 @@ class DrawdownEpisode:
     days_to_recover: int | None
 
 
-def drawdown_episodes(returns: pd.Series, top: int = 5) -> list[DrawdownEpisode]:
+def drawdown_episodes(
+    returns: pd.Series, top: int = 5, missing: Missing = "raise"
+) -> list[DrawdownEpisode]:
     """The `top` deepest separate drawdowns of one asset, deepest first."""
     if not isinstance(returns, pd.Series):
         raise TypeError("drawdown_episodes takes one asset (a Series)")
-    dd = drawdown_series(returns)
+    dd = drawdown_series(returns, missing).dropna()  # leading NaNs: not trading yet
     underwater = dd < 0
     episodes: list[DrawdownEpisode] = []
     # Each run of consecutive underwater days is one episode.
@@ -103,7 +114,8 @@ def drawdown_episodes(returns: pd.Series, top: int = 5) -> list[DrawdownEpisode]
     for _, block in dd[underwater].groupby(run_id[underwater]):
         start_pos = positions[block.index[0]]
         end_pos = positions[block.index[-1]]
-        trough = block.idxmin()
+        # First date within rounding distance of the low, so ties pick the earliest.
+        trough = block[block <= block.min() + _DD_TOL].index[0]
         peak = dd.index[start_pos - 1] if start_pos > 0 else None
         recovery = dd.index[end_pos + 1] if end_pos + 1 < len(dd) else None
         peak_pos = start_pos - 1

@@ -29,10 +29,16 @@ def check_prices(prices: Frame, min_rows: int = 2) -> Frame:
 def check_returns(returns: Frame, min_rows: int = 2) -> Frame:
     if not isinstance(returns, pd.Series | pd.DataFrame):
         raise TypeError(f"expected a pandas Series or DataFrame, got {type(returns).__name__}")
-    clean = returns.dropna(how="all")
-    if len(clean) < min_rows:
-        raise InsufficientDataError(f"need at least {min_rows} returns, got {len(clean)}")
-    values = clean.to_numpy(dtype="float64")
+    # Count observations without dropping anything: gaps must stay visible so the
+    # compounding functions can apply the missing-data policy.
+    n = (
+        int(returns.notna().any(axis=1).sum())
+        if isinstance(returns, pd.DataFrame)
+        else int(returns.notna().sum())
+    )
+    if n < min_rows:
+        raise InsufficientDataError(f"need at least {min_rows} returns, got {n}")
+    values = returns.to_numpy(dtype="float64")
     if (values[~pd.isna(values)] <= -1).any():
         raise ValueError("a simple return of -100% or less is impossible for a long position")
-    return clean
+    return returns

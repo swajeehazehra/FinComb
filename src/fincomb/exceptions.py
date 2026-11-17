@@ -23,3 +23,7 @@ class ValidationError(FinCombError):
 
 class InsufficientDataError(FinCombError):
     """Not enough observations to compute a statistic."""
+
+
+class MissingDataError(FinCombError):
+    """A gap in the middle of a return series where compounding needs every period."""

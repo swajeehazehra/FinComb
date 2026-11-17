@@ -166,11 +166,13 @@ def show(
     typer.echo(df.tail(tail).to_string())
 
 
-def _load(symbols: list[str], start: str | None, end: str | None):
+def _load(symbols: list[str], start: str | None, end: str | None, align: str = "inner"):
+    if align not in ("inner", "outer"):
+        raise typer.BadParameter("align must be 'inner' or 'outer'")
     _, factory = _session_factory()
     try:
         with session_scope(factory) as s:
-            return load_prices(s, symbols, _parse_date(start), _parse_date(end))
+            return load_prices(s, symbols, _parse_date(start), _parse_date(end), align=align)  # type: ignore[arg-type]
     except FinCombError as exc:
         typer.secho(str(exc), fg="red", err=True)
         raise typer.Exit(1) from exc
@@ -190,24 +192,37 @@ def analyze(
     start: Annotated[str | None, typer.Option(help="YYYY-MM-DD")] = None,
     end: Annotated[str | None, typer.Option(help="YYYY-MM-DD")] = None,
     risk_free: Annotated[float, typer.Option(help="Annual risk-free rate, 0.04 = 4%")] = 0.0,
+    align: Annotated[
+        str,
+        typer.Option(
+            help="inner = only dates all symbols share (default); "
+            "outer = each symbol over its own full history"
+        ),
+    ] = "inner",
 ) -> None:
     """Return, volatility, Sharpe, Sortino and drawdown for each symbol."""
-    prices = _load(symbols, start, end)
+    prices = _load(symbols, start, end, align)
     table = performance_summary(prices, risk_free=risk_free)
-    typer.echo(
-        f"\nPeriod {table['start'].min()} to {table['end'].max()}, "
-        f"{int(table['observations'].iloc[0])} daily returns, "
-        f"risk-free {risk_free:.2%}\n"
-    )
+    outer = align == "outer"
+    if outer:
+        typer.echo(f"\nEach symbol over its own history, risk-free {risk_free:.2%}\n")
+    else:
+        typer.echo(
+            f"\nPeriod {table['start'].min()} to {table['end'].max()}, "
+            f"{int(table['observations'].iloc[0])} daily returns, "
+            f"risk-free {risk_free:.2%}\n"
+        )
     header = (
-        f"{'symbol':<8}{'total':>10}{'CAGR':>9}{'vol':>9}{'sharpe':>8}"
+        f"{'symbol':<8}{'from' if outer else '':>{12 if outer else 0}}"
+        f"{'total':>10}{'CAGR':>9}{'vol':>9}{'sharpe':>8}"
         f"{'sortino':>9}{'max DD':>10}{'calmar':>8}"
     )
     typer.echo(header)
     typer.echo("-" * len(header))
     for sym, r in table.iterrows():
+        since = f"{str(r.start):>12}" if outer else ""
         typer.echo(
-            f"{sym:<8}{_pct(r.total_return):>10}{_pct(r.cagr):>9}"
+            f"{sym:<8}{since}{_pct(r.total_return):>10}{_pct(r.cagr):>9}"
             f"{_pct(r.annual_volatility):>9}{_num(r.sharpe):>8}{_num(r.sortino):>9}"
             f"{_pct(r.max_drawdown):>10}{_num(r.calmar):>8}"
         )
@@ -219,9 +234,19 @@ def correlation(
     start: Annotated[str | None, typer.Option(help="YYYY-MM-DD")] = None,
     end: Annotated[str | None, typer.Option(help="YYYY-MM-DD")] = None,
     method: Annotated[str, typer.Option(help="pearson or spearman")] = "pearson",
+    align: Annotated[
+        str,
+        typer.Option(
+            help="inner = only dates all symbols share (default); "
+            "outer = each symbol over its own full history"
+        ),
+    ] = "inner",
 ) -> None:
-    """Correlation matrix of daily returns."""
-    prices = _load(symbols, start, end)
+    """Correlation matrix of daily returns.
+
+    With --align outer each pair uses the days both symbols traded.
+    """
+    prices = _load(symbols, start, end, align)
     try:
         corr = correlation_matrix(simple_returns(prices), method=method)  # type: ignore[arg-type]
     except (ValueError, FinCombError) as exc:
