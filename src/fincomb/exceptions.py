@@ -23,3 +23,11 @@ class DataOwnershipError(FinCombError):
 
 class ValidationError(FinCombError):
     """Input data failed validation."""
+
+
+class InsufficientDataError(FinCombError):
+    """Not enough observations to compute a statistic."""
+
+
+class MissingDataError(FinCombError):
+    """A gap in the middle of a return series where compounding needs every period."""

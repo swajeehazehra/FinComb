@@ -8,7 +8,7 @@ look-ahead bias.
 Tech stack: Python · PostgreSQL · SQLAlchemy · Alembic · FastAPI · pandas / NumPy ·
 SciPy / Statsmodels · Plotly · Streamlit · Pytest · Docker
 
-> Status: **Milestone 1 of 7 done** (foundation and data pipeline). See the
+> Status: **Milestone 2 of 7 done** (data pipeline and analytics core). See the
 > [roadmap](#roadmap).
 
 ## What works today
@@ -28,6 +28,10 @@ SciPy / Statsmodels · Plotly · Streamlit · Pytest · Docker
   of a stitched history. `fincomb check-data` audits it and `fincomb refresh`
   repairs it.
 - Schema managed with **Alembic** migrations; config from environment variables only.
+- **Analytics core:** returns, CAGR, volatility, Sharpe, Sortino, maximum drawdown
+  and drawdown episodes, Calmar, rolling statistics and correlation matrices, as
+  pure, tested functions. Conventions are documented in
+  [docs/METHODOLOGY.md](docs/METHODOLOGY.md).
 
 ## Quick start
 
@@ -46,6 +50,9 @@ alembic upgrade head              # create the tables
 fincomb check-db
 fincomb ingest AAPL MSFT SPY --start 2015-01-01
 fincomb coverage
+fincomb analyze AAPL MSFT SPY --risk-free 0.04
+fincomb correlation AAPL MSFT SPY
+fincomb drawdowns SPY
 pytest
 ```
 
@@ -58,6 +65,8 @@ src/fincomb/
   db/                  SQLAlchemy models, engine, repositories (all SQL lives here)
   ingestion/           MarketDataSource + yfinance, tiingo, csv adapters, pipeline
   validation/          data-quality rules
+  analytics/           returns, risk, correlation (pure functions, no I/O)
+  services/            loads stored prices for the analytics
   cli.py               `fincomb` command
 migrations/            Alembic schema migrations
 tests/unit/            fast tests, no database, no network
@@ -69,7 +78,7 @@ docs/                  architecture and milestone guides
 ## Roadmap
 
 1. ✅ Foundation and data pipeline
-2. Analytics core: returns, volatility, Sharpe, drawdown, correlation
+2. ✅ Analytics core: returns, volatility, Sharpe, drawdown, correlation
 3. FastAPI backend
 4. Portfolio construction and risk
 5. Strategies (momentum, mean reversion) and a backtest engine with costs and slippage
