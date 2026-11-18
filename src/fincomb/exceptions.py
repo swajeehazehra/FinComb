@@ -31,3 +31,11 @@ class InsufficientDataError(FinCombError):
 
 class MissingDataError(FinCombError):
     """A gap in the middle of a return series where compounding needs every period."""
+
+
+class PortfolioNotFoundError(FinCombError):
+    """No saved portfolio with that id or name."""
+
+
+class PortfolioExistsError(FinCombError):
+    """A portfolio with that name already exists (names are unique)."""

@@ -8,9 +8,18 @@ from datetime import date
 import pandas as pd
 from sqlalchemy import delete, func, literal_column, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
-from fincomb.db.models import AssetType, DataQualityIssue, IngestionRun, Instrument, PriceBar
+from fincomb.db.models import (
+    AssetType,
+    DataQualityIssue,
+    IngestionRun,
+    Instrument,
+    Portfolio,
+    PortfolioMethod,
+    PortfolioWeight,
+    PriceBar,
+)
 
 PRICE_COLUMNS = ["open", "high", "low", "close", "adj_close", "volume"]
 # Postgres allows at most 65,535 bind parameters per statement (10 per row here).
@@ -234,3 +243,65 @@ class IngestionRunRepository:
             .order_by(DataQualityIssue.id)
         )
         return [(issue, symbol) for issue, symbol in self.session.execute(stmt)]
+
+
+class PortfolioRepository:
+    """Saved portfolios. Weights are stored per instrument; callers pass symbols."""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def create(
+        self,
+        name: str,
+        weights: dict[str, float],
+        construction_method: PortfolioMethod,
+        effective_method: PortfolioMethod,
+        params: dict | None = None,
+        description: str | None = None,
+        estimation_start: date | None = None,
+        estimation_end: date | None = None,
+    ) -> Portfolio:
+        """Insert a portfolio. Every symbol must already be a stored instrument."""
+        instruments = InstrumentRepository(self.session)
+        portfolio = Portfolio(
+            name=name,
+            description=description,
+            construction_method=construction_method,
+            effective_method=effective_method,
+            construction_params=params or {},
+            estimation_start=estimation_start,
+            estimation_end=estimation_end,
+        )
+        for symbol, weight in weights.items():
+            instrument = instruments.get_by_symbol(symbol)
+            if instrument is None:
+                raise ValueError(f"{symbol} is not a stored instrument")
+            portfolio.weights.append(PortfolioWeight(instrument_id=instrument.id, weight=weight))
+        self.session.add(portfolio)
+        self.session.flush()
+        return portfolio
+
+    def _query(self):
+        return select(Portfolio).options(
+            selectinload(Portfolio.weights).selectinload(PortfolioWeight.instrument)
+        )
+
+    def get(self, portfolio_id: int) -> Portfolio | None:
+        return self.session.scalars(self._query().where(Portfolio.id == portfolio_id)).first()
+
+    def get_by_name(self, name: str) -> Portfolio | None:
+        return self.session.scalars(self._query().where(Portfolio.name == name)).first()
+
+    def list_all(self) -> list[Portfolio]:
+        return list(self.session.scalars(self._query().order_by(Portfolio.name)))
+
+    def delete(self, portfolio: Portfolio) -> None:
+        self.session.delete(portfolio)
+        self.session.flush()
+
+    @staticmethod
+    def weights_of(portfolio: Portfolio) -> dict[str, float]:
+        """{symbol: weight}, in symbol order."""
+        pairs = sorted((w.instrument.symbol, w.weight) for w in portfolio.weights)
+        return dict(pairs)

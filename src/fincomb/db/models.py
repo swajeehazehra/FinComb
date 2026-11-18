@@ -1,6 +1,6 @@
-"""SQLAlchemy ORM models for the market-data part of the schema (Milestone 1).
+"""SQLAlchemy ORM models: market data (Milestone 1) and portfolios (Milestone 4).
 
-Portfolio and backtest tables arrive in later milestones as new migrations.
+Backtest tables arrive in Milestone 5 as a new migration.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ from sqlalchemy import (
     Text,
     func,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from fincomb.db.base import Base
@@ -38,6 +39,14 @@ class RunStatus(enum.StrEnum):
     SUCCESS = "success"
     PARTIAL = "partial"
     FAILED = "failed"
+
+
+class PortfolioMethod(enum.StrEnum):
+    MANUAL = "manual"
+    EQUAL_WEIGHT = "equal_weight"
+    INVERSE_VOL = "inverse_vol"
+    MIN_VARIANCE = "min_variance"
+    MAX_SHARPE = "max_sharpe"
 
 
 class Severity(enum.StrEnum):
@@ -149,3 +158,52 @@ class DataQualityIssue(Base):
     detail: Mapped[str | None] = mapped_column(Text)
 
     run: Mapped[IngestionRun] = relationship(back_populates="issues")
+
+
+class Portfolio(Base):
+    __tablename__ = "portfolios"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    # What was asked for, and what actually produced the weights (they differ only
+    # when an optimiser fell back to inverse volatility).
+    construction_method: Mapped[PortfolioMethod] = mapped_column(
+        _pg_enum(PortfolioMethod, "portfolio_method"), nullable=False
+    )
+    effective_method: Mapped[PortfolioMethod] = mapped_column(
+        _pg_enum(PortfolioMethod, "portfolio_method"), nullable=False
+    )
+    # Everything needed to reproduce the weights: bounds, covariance method,
+    # shrinkage, risk-free rate, optimiser status, warnings...
+    construction_params: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    estimation_start: Mapped[date | None] = mapped_column(Date)  # first price date used
+    estimation_end: Mapped[date | None] = mapped_column(Date)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    weights: Mapped[list[PortfolioWeight]] = relationship(
+        back_populates="portfolio", cascade="all, delete-orphan", passive_deletes=True
+    )
+
+    def __repr__(self) -> str:
+        return f"Portfolio({self.name!r}, {self.construction_method.value})"
+
+
+class PortfolioWeight(Base):
+    __tablename__ = "portfolio_weights"
+    __table_args__ = (
+        CheckConstraint("weight >= 0 AND weight <= 1", name="ck_portfolio_weights_long_only"),
+    )
+
+    portfolio_id: Mapped[int] = mapped_column(
+        ForeignKey("portfolios.id", ondelete="CASCADE"), primary_key=True
+    )
+    instrument_id: Mapped[int] = mapped_column(
+        ForeignKey("instruments.id", ondelete="RESTRICT"), primary_key=True
+    )
+    weight: Mapped[float] = mapped_column(Float, nullable=False)
+
+    portfolio: Mapped[Portfolio] = relationship(back_populates="weights")
+    instrument: Mapped[Instrument] = relationship()
