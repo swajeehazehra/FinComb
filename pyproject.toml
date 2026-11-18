@@ -15,6 +15,7 @@ dependencies = [
     "pydantic-settings>=2.2,<3",
     "pandas>=2.2,<4",
     "numpy>=1.26,<3",
+    "scipy>=1.11,<2",  # SLSQP optimiser and normal quantiles (Milestone 4)
     "yfinance>=0.2.50",
     "typer>=0.12,<1",
     "tzdata>=2024.1",  # time-zone database for zoneinfo (Windows has none built in)
