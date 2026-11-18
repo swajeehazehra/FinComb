@@ -61,6 +61,16 @@ class InstrumentRepository:
             instrument.asset_type = asset_type
         return instrument
 
+    def list_instruments(
+        self, asset_type: AssetType | None = None, active: bool | None = None
+    ) -> list[Instrument]:
+        stmt = select(Instrument).order_by(Instrument.symbol)
+        if asset_type is not None:
+            stmt = stmt.where(Instrument.asset_type == asset_type)
+        if active is not None:
+            stmt = stmt.where(Instrument.is_active == active)
+        return list(self.session.scalars(stmt))
+
     def all_symbols(self) -> list[str]:
         return list(self.session.scalars(select(Instrument.symbol).order_by(Instrument.symbol)))
 
@@ -209,3 +219,18 @@ class IngestionRunRepository:
 
     def get(self, run_id: int) -> IngestionRun | None:
         return self.session.get(IngestionRun, run_id)
+
+    def recent(self, limit: int = 20) -> list[IngestionRun]:
+        """Most recent runs first."""
+        stmt = select(IngestionRun).order_by(IngestionRun.id.desc()).limit(limit)
+        return list(self.session.scalars(stmt))
+
+    def issues_with_symbols(self, run_id: int) -> list[tuple[DataQualityIssue, str | None]]:
+        """A run's data-quality issues, each with its instrument's symbol."""
+        stmt = (
+            select(DataQualityIssue, Instrument.symbol)
+            .outerjoin(Instrument, Instrument.id == DataQualityIssue.instrument_id)
+            .where(DataQualityIssue.ingestion_run_id == run_id)
+            .order_by(DataQualityIssue.id)
+        )
+        return [(issue, symbol) for issue, symbol in self.session.execute(stmt)]
