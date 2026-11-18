@@ -119,6 +119,131 @@ series look highly correlated even when their daily moves are unrelated.
 
 Each pair needs at least 20 overlapping returns, otherwise the cell is NaN.
 
+## Portfolio construction
+
+All four methods are **long-only and fully invested**: weights sum to 1 and each
+lies in `[min_weight, max_weight]` (defaults 0 and 1). The bounds are checked before
+anything is solved: N assets need N × max_weight ≥ 1 and N × min_weight ≤ 1.
+
+**Estimation window.** By default the last 252 daily returns (`lookback`) ending at
+`end` (default: the latest date every asset has); with an explicit `start` the
+whole `[start, end]` range is used. Assets are inner-aligned. The window needs at
+least max(60, 2N) returns, because a covariance matrix estimated from barely more
+rows than assets is singular or very noisy. Daily means μ and covariances Σ come
+from this window and are annualised with 252.
+
+**Equal weight**: 1/N each. No estimation error at all, which is why it is hard to
+beat out of sample; it ignores risk differences, though.
+
+**Inverse volatility**: $w_i \propto 1/\sigma_i$. Equal risk contributions when
+all correlations are equal ("naive risk parity"); it ignores correlations. With
+bounds, $w_i = \text{clip}(c/\sigma_i, \text{min}, \text{max})$ with the single
+scalar $c$ that makes them sum to 1. The sum is continuous and non-decreasing in
+$c$, from N × min_weight to N × max_weight, so a solution exists whenever the
+bounds are feasible; assets not pinned at a bound keep their 1/σ proportions. An
+asset with zero volatility in the window is rejected.
+
+**Minimum variance**: minimise $w^\top \Sigma w$. It needs no expected returns,
+and the problem is convex, so the optimum is global. Unconstrained,
+$w^* = \Sigma^{-1}\mathbf{1} / \mathbf{1}^\top\Sigma^{-1}\mathbf{1}$; at a bounded
+optimum every asset strictly inside its bounds has the same marginal variance
+$(\Sigma w)_i$. It tends to concentrate in the least volatile assets, and it is
+minimum variance *in sample*: realised variance afterwards is higher.
+
+**Maximum Sharpe**: maximise $(w^\top\mu - r_f)/\sqrt{w^\top\Sigma w}$, scaled by
+√252 so it means the same as the Sharpe ratio elsewhere. Unconstrained,
+$w \propto \Sigma^{-1}(\mu - r_f\mathbf{1})$. The ratio is quasi-concave where the
+excess return is positive, so a local maximum is the global one. **Mean returns
+from a year of data are mostly noise** (their standard error is about σ/√years,
+so ±25% a year for a 25%-volatility stock), and the optimiser treats that noise as
+signal: expect concentrated, unstable weights unless `max_weight` caps them.
+
+**When no asset beats the risk-free rate.** If every asset's estimated excess
+return is ≤ 0, every long-only portfolio has a negative expected Sharpe ratio.
+Maximising a negative ratio rewards a *larger* denominator, i.e. **higher
+volatility**, so the "optimal" weights can look perverse (for example 100% in the
+most volatile asset). FinComb still returns them, because they are the correct
+answer to the question asked, but it never switches to another method silently:
+the result has `non_positive_excess_return: true` and a warning, shown above the
+weights in the CLI and in `warnings` in the API, and kept with a saved portfolio.
+**Such a portfolio is not an attractive investment and should not be read as a
+recommendation**; use minimum variance, another window or a lower risk-free rate.
+Because the problem is no longer well-behaved, SLSQP is started from equal
+weights, inverse volatility and one corner per asset, and the best answer kept.
+
+## The optimiser
+
+Minimum variance and maximum Sharpe use SciPy's SLSQP with analytic gradients
+(2Σw, and the quotient rule for the Sharpe ratio), the equality constraint
+sum(w) = 1, box bounds, `ftol = 1e-12`, at most 500 iterations, starting from
+equal weights. Σ is annualised first so the objective isn't of order 1e-4, where
+an absolute tolerance would stop too early.
+
+**Covariance regularisation.** The default estimator is **Ledoit-Wolf
+shrinkage** toward a scaled identity, $\hat\Sigma = \delta F + (1-\delta) S$ with
+$F = \operatorname{tr}(S)/N \cdot I$. The intensity δ is the Ledoit-Wolf (2004)
+formula that minimises expected estimation error; it is reported with every
+result (small for 6 assets and 252 days, large for 30 assets and 60 days).
+`covariance=sample` uses $S$ alone. In both cases a matrix whose smallest
+eigenvalue is not above $10^{-12}$ times its largest (duplicate, collinear or
+flat assets) gets the smallest ridge $\varepsilon \cdot \operatorname{tr}(\Sigma)/N
+\cdot I$, ε = 1e-10 … 1e-4, that fixes it, with a warning.
+
+**Checking the answer.** SciPy's `success` flag is not trusted alone: weights
+within 1e-10 of a bound are snapped to it, and the result must sum to 1 and lie
+in the bounds within 1e-8. It must also be at least as good as every simple
+feasible portfolio (equal weight, inverse volatility, and for maximum Sharpe one
+corner per asset).
+
+**Fallback.** If the covariance can't be repaired, SLSQP fails, or the answer
+fails a check, the weights are bounded inverse volatility instead.
+`fallback_used`, `fallback_reason`, `effective_method: inverse_vol` and a warning
+say so, and a saved portfolio stores both the requested and the effective method.
+
+The statistics reported with constructed weights (return, volatility, Sharpe)
+are **in-sample**: they describe the window the weights were fitted on, which
+flatters them. Evaluate a portfolio on a later period with the risk report.
+
+## Portfolio risk
+
+**Portfolio returns** are *constant mix*: $r_{p,t} = \sum_i w_i r_{i,t}$, as if
+rebalanced to the weights every day. That is the standard ex-ante convention and
+keeps the identities exact (std of $r_p$ = $\sqrt{w^\top S w}$). Drift between
+rebalances belongs to the backtester (Milestone 5). Total return, CAGR, Sharpe,
+drawdown and the rest come from the existing performance code applied to the
+portfolio's value series.
+
+**VaR and CVaR** are **1-day** losses reported as **positive numbers**, at
+confidence α (default 95%). Historical VaR is minus the $(1-\alpha)$ quantile of
+the portfolio's daily returns, using **linear interpolation** between sorted
+returns (NumPy's default, Excel's PERCENTILE.INC). Historical CVaR (expected
+shortfall) is the average of that **same** quantile function over the tail:
+
+$$\text{CVaR}_\alpha = -\frac{1}{1-\alpha}\int_0^{1-\alpha} Q(u)\,du$$
+
+$Q$ is piecewise linear between the sorted returns, so the integral is computed
+exactly with trapezoids. A fractional tail (12.6 observations for 252 days at
+95%) needs no rounding, and because $Q$ never decreases its average below
+$1-\alpha$ is at most $Q(1-\alpha)$: **CVaR ≥ VaR always**. Gaussian VaR,
+$-(\bar r + z_{1-\alpha}\sigma)$, and CVaR, $\sigma\varphi(z_{1-\alpha})/(1-\alpha) -
+\bar r$, are shown alongside; a historical figure well above the Gaussian one
+means fatter tails than normal. With fewer than 10 observations in the tail (for
+example 99% on one year of data) the report warns that the historical figures are
+unreliable. No √h scaling to longer horizons is applied.
+
+**Beta and alpha** against a benchmark (default SPY): $\beta = \text{Cov}(r_p,
+r_b)/\text{Var}(r_b)$, the OLS slope, on the dates both have. Jensen's alpha
+$= \overline{r_p - r_f} - \beta\,\overline{r_b - r_f}$, annualised ×252. With a
+constant risk-free rate, beta is the same for raw and excess returns. Correlation
+and R² are reported too. A zero-variance benchmark gives null beta.
+
+**Risk contributions** (annualised, Euler decomposition): marginal
+$\text{MCR}_i = (\Sigma w)_i/\sigma_p$, component $\text{CR}_i = w_i\,\text{MCR}_i$
+(they sum exactly to $\sigma_p$), and percentage $\text{CR}_i/\sigma_p$ (sums to
+100%). A negative contribution means the asset lowers total risk. The report uses
+the plain sample covariance of the analysis period, since it describes what
+happened; shrinkage only helps the optimiser.
+
 ## Bias and reproducibility controls
 
 * Rolling statistics use only past data. A test changes every return after a
@@ -155,4 +280,8 @@ The backtester (Milestone 5) will therefore follow one rule:
   provider re-adjusts the whole history. Re-ingesting updates stored values.
 * **Normality:** Sharpe and √252 scaling treat returns as roughly normal and
   independent. Fat tails and volatility clustering are not captured by these
-  numbers.
+  numbers. Gaussian VaR/CVaR share this assumption; the historical figures don't.
+* **Estimation error in optimised portfolios:** minimum-variance and maximum-Sharpe
+  weights are fitted to one window of history. Their in-sample statistics are
+  optimistic, and maximum-Sharpe weights in particular change a lot from one
+  window to the next.
