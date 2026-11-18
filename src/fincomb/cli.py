@@ -4,6 +4,7 @@ fincomb check-db
 fincomb ingest AAPL MSFT SPY --start 2015-01-01
 fincomb coverage
 fincomb show AAPL --start 2024-01-01
+fincomb portfolio compare AAPL MSFT SPY TLT --max-weight 0.4
 fincomb serve            # REST API on http://127.0.0.1:8000 (docs at /docs)
 
 Commands only parse arguments and print results: the work is done by the shared
@@ -28,7 +29,7 @@ from fincomb.exceptions import FinCombError
 from fincomb.ingestion.audit import audit_data
 from fincomb.ingestion.registry import SOURCES
 from fincomb.logging_config import configure_logging
-from fincomb.services import analytics_service, ingestion_service
+from fincomb.services import analytics_service, ingestion_service, portfolio_service
 
 app = typer.Typer(help="FinComb command-line tools.", no_args_is_help=True)
 logger = logging.getLogger("fincomb.cli")
@@ -375,6 +376,291 @@ def drawdowns(
             f"{str(e.recovery.date()) if e.recovery else 'not yet':<12}"
             f"{e.days_to_trough:>10}{e.days_to_recover if e.days_to_recover else '-':>9}"
         )
+
+
+# --- portfolios (Milestone 4) ---------------------------------------------------------------
+
+portfolio_app = typer.Typer(
+    help="Build, save and analyse portfolios (long-only, fully invested).",
+    no_args_is_help=True,
+)
+app.add_typer(portfolio_app, name="portfolio")
+
+METHOD_CHOICES = ("equal-weight", "inverse-vol", "min-variance", "max-sharpe")
+
+
+def _method(value: str) -> str:
+    method = value.strip().lower().replace("-", "_")
+    if method not in ("equal_weight", "inverse_vol", "min_variance", "max_sharpe"):
+        raise typer.BadParameter(f"method must be one of {', '.join(METHOD_CHOICES)}")
+    return method
+
+
+def _covariance(value: str) -> str:
+    cov = value.strip().lower().replace("-", "_")
+    if cov not in ("ledoit_wolf", "sample"):
+        raise typer.BadParameter("covariance must be ledoit-wolf or sample")
+    return cov
+
+
+def _print_warnings(warnings: list[str]) -> None:
+    """Warnings go ABOVE the numbers, highlighted, so they can't be missed."""
+    for w in warnings:
+        typer.secho(f"\nWARNING: {w}", fg="red", bold=True)
+    if warnings:
+        typer.echo("")
+
+
+def _parse_weights(text_value: str) -> dict[str, float]:
+    weights: dict[str, float] = {}
+    for part in text_value.split(","):
+        if not part.strip():
+            continue
+        symbol, sep, number = part.partition("=")
+        if not sep:
+            raise typer.BadParameter(f"{part!r}: write weights as SYMBOL=WEIGHT, e.g. SPY=0.6")
+        try:
+            value = float(number)
+        except ValueError as exc:
+            raise typer.BadParameter(f"{number!r} is not a number") from exc
+        key = symbol.strip().upper()
+        if key in weights:
+            raise typer.BadParameter(f"{key} is listed twice")
+        weights[key] = value
+    if not weights:
+        raise typer.BadParameter("give at least one SYMBOL=WEIGHT")
+    return weights
+
+
+def _spec(symbols, method, start, end, lookback, min_weight, max_weight, covariance, risk_free):
+    return portfolio_service.ConstructionSpec(
+        symbols=symbols,
+        method=_method(method),
+        start=_parse_date(start),
+        end=_parse_date(end),
+        lookback=lookback,
+        min_weight=min_weight,
+        max_weight=max_weight,
+        covariance=_covariance(covariance),
+        risk_free=risk_free,
+    )
+
+
+def _print_construction(outcome) -> None:
+    r = outcome.result
+    method = r.method if not r.fallback_used else f"{r.method} (fell back to {r.effective_method})"
+    typer.echo(
+        f"\n{method}: window {r.start.date()} to {r.end.date()} "
+        f"({r.observations} daily returns), bounds {r.bounds.min_weight:.0%} to "
+        f"{r.bounds.max_weight:.0%}"
+    )
+    if r.covariance:
+        shrink = "" if r.shrinkage is None else f", shrinkage {r.shrinkage:.1%}"
+        typer.echo(f"covariance: {r.covariance}{shrink}")
+    _print_warnings(r.warnings)
+    typer.echo(f"\n{'symbol':<8}{'weight':>9}{'risk share':>12}")
+    for sym, row in outcome.contributions.iterrows():
+        typer.echo(f"{sym:<8}{_pct(row.weight):>9}{_pct(row.percent):>12}")
+    typer.echo(
+        f"\nIn-sample (the window the weights were fitted on, so flattering): "
+        f"return {_pct(r.expected_return)}, volatility {_pct(r.volatility)}, "
+        f"Sharpe {_num(r.sharpe)} (risk-free {r.risk_free:.2%})"
+    )
+    _print_alignment_notes(outcome.notes)
+
+
+LookbackOpt = Annotated[
+    int, typer.Option(help="Daily returns in the window (ignored with --start)")
+]
+MinWeightOpt = Annotated[float, typer.Option(help="Smallest weight per asset, 0.05 = 5%")]
+MaxWeightOpt = Annotated[float, typer.Option(help="Largest weight per asset, 0.4 = 40%")]
+CovOpt = Annotated[str, typer.Option(help="ledoit-wolf (default) or sample")]
+RiskFreeOpt = Annotated[float, typer.Option(help="Annual risk-free rate, 0.04 = 4%")]
+DateOpt = Annotated[str | None, typer.Option(help="YYYY-MM-DD")]
+
+
+@portfolio_app.command("construct")
+def portfolio_construct(
+    symbols: Annotated[list[str], typer.Argument(help="Tickers already ingested")],
+    method: Annotated[str, typer.Option(help=", ".join(METHOD_CHOICES))] = "min-variance",
+    start: DateOpt = None,
+    end: DateOpt = None,
+    lookback: LookbackOpt = portfolio_service.DEFAULT_LOOKBACK,
+    min_weight: MinWeightOpt = 0.0,
+    max_weight: MaxWeightOpt = 1.0,
+    covariance: CovOpt = "ledoit-wolf",
+    risk_free: RiskFreeOpt = 0.0,
+    save: Annotated[str | None, typer.Option(help="Save under this name")] = None,
+    description: Annotated[str | None, typer.Option(help="Saved with --save")] = None,
+) -> None:
+    """Compute portfolio weights from stored prices (and optionally save them)."""
+    spec = _spec(
+        symbols, method, start, end, lookback, min_weight, max_weight, covariance, risk_free
+    )
+    if save:
+        record, outcome = _analyse(portfolio_service.create_constructed, save, spec, description)
+        _print_construction(outcome)
+        typer.secho(f"\nSaved as {record.name!r} (id {record.id}).", fg="green")
+    else:
+        _print_construction(_analyse(portfolio_service.construct_portfolio, spec))
+
+
+@portfolio_app.command("compare")
+def portfolio_compare(
+    symbols: Annotated[list[str], typer.Argument(help="Tickers already ingested")],
+    start: DateOpt = None,
+    end: DateOpt = None,
+    lookback: LookbackOpt = portfolio_service.DEFAULT_LOOKBACK,
+    min_weight: MinWeightOpt = 0.0,
+    max_weight: MaxWeightOpt = 1.0,
+    covariance: CovOpt = "ledoit-wolf",
+    risk_free: RiskFreeOpt = 0.0,
+) -> None:
+    """All four methods side by side on the same window."""
+    outcomes = {}
+    for m in METHOD_CHOICES:
+        spec = _spec(
+            symbols, m, start, end, lookback, min_weight, max_weight, covariance, risk_free
+        )
+        outcomes[m] = _analyse(portfolio_service.construct_portfolio, spec)
+    first = next(iter(outcomes.values())).result
+    typer.echo(
+        f"\nWindow {first.start.date()} to {first.end.date()} ({first.observations} daily "
+        f"returns), risk-free {risk_free:.2%}"
+    )
+    for m, out in outcomes.items():
+        for w in out.result.warnings:
+            typer.secho(f"\nWARNING ({m}): {w}", fg="red", bold=True)
+    header = f"\n{'':<12}" + "".join(f"{m:>14}" for m in outcomes)
+    typer.echo(header)
+    for sym in first.weights.index:
+        typer.echo(
+            f"{sym:<12}" + "".join(f"{_pct(o.result.weights[sym]):>14}" for o in outcomes.values())
+        )
+    typer.echo("-" * (12 + 14 * len(outcomes)))
+    for label, attr, fmt in (
+        ("return", "expected_return", _pct),
+        ("volatility", "volatility", _pct),
+        ("Sharpe", "sharpe", _num),
+    ):
+        typer.echo(
+            f"{label:<12}"
+            + "".join(f"{fmt(getattr(o.result, attr)):>14}" for o in outcomes.values())
+        )
+    typer.echo("\nReturn, volatility and Sharpe are in-sample (the fitting window).")
+    _print_alignment_notes(next(iter(outcomes.values())).notes)
+
+
+@portfolio_app.command("create")
+def portfolio_create(
+    name: str,
+    weights: Annotated[str, typer.Option(help="SYMBOL=WEIGHT pairs, e.g. SPY=0.6,TLT=0.4")],
+    description: Annotated[str | None, typer.Option()] = None,
+) -> None:
+    """Save a portfolio with weights you choose (they must sum to 1)."""
+    record = _analyse(portfolio_service.create_manual, name, _parse_weights(weights), description)
+    typer.secho(
+        f"Saved {record.name!r} (id {record.id}) with {len(record.weights)} assets.", fg="green"
+    )
+
+
+@portfolio_app.command("list")
+def portfolio_list() -> None:
+    """Saved portfolios."""
+    records = _analyse(portfolio_service.list_portfolios)
+    if not records:
+        typer.echo("No portfolios yet. Try: fincomb portfolio construct AAPL SPY TLT --save NAME")
+        return
+    typer.echo(f"{'id':>4}  {'name':<24}{'method':<34}{'assets':>7}  created")
+    for p in records:
+        method = p.construction_method
+        if p.effective_method != p.construction_method:
+            method += f" (fell back to {p.effective_method})"
+        flag = "  [warnings]" if p.warnings else ""
+        typer.echo(
+            f"{p.id:>4}  {p.name:<24}{method:<34}{len(p.weights):>7}  {p.created_at:%Y-%m-%d}{flag}"
+        )
+
+
+@portfolio_app.command("show")
+def portfolio_show(name: Annotated[str, typer.Argument(help="Name or id")]) -> None:
+    """Weights and the parameters that produced them."""
+    p = _analyse(portfolio_service.get_portfolio, name)
+    typer.echo(f"\n{p.name} (id {p.id}): {p.construction_method}")
+    if p.effective_method != p.construction_method:
+        typer.echo(f"weights actually from: {p.effective_method}")
+    if p.description:
+        typer.echo(p.description)
+    if p.estimation_start:
+        params = p.construction_params
+        typer.echo(
+            f"estimated on {p.estimation_start} to {p.estimation_end} "
+            f"({params.get('observations')} returns), bounds {params.get('min_weight'):.0%} "
+            f"to {params.get('max_weight'):.0%}, covariance {params.get('covariance') or '-'}, "
+            f"risk-free {params.get('risk_free', 0):.2%}"
+        )
+    _print_warnings(p.warnings)
+    typer.echo(f"\n{'symbol':<8}{'weight':>9}")
+    for sym, w in p.weights.items():
+        typer.echo(f"{sym:<8}{_pct(w):>9}")
+
+
+@portfolio_app.command("risk")
+def portfolio_risk(
+    name: Annotated[str, typer.Argument(help="Name or id")],
+    start: DateOpt = None,
+    end: DateOpt = None,
+    benchmark: Annotated[
+        str, typer.Option(help="Benchmark for beta; empty string for none")
+    ] = portfolio_service.DEFAULT_BENCHMARK,
+    confidence: Annotated[float, typer.Option(help="VaR confidence, 0.95 = 95%")] = 0.95,
+    risk_free: RiskFreeOpt = 0.0,
+) -> None:
+    """Volatility, VaR/CVaR, beta and risk contributions of a saved portfolio."""
+    out = _analyse(
+        portfolio_service.portfolio_risk,
+        name,
+        _parse_date(start),
+        _parse_date(end),
+        benchmark or None,
+        confidence,
+        risk_free,
+    )
+    rep = out.report
+    typer.echo(
+        f"\n{out.portfolio.name}: {rep.start.date()} to {rep.end.date()} "
+        f"({rep.observations} daily returns), daily rebalanced to its weights"
+    )
+    _print_warnings(out.portfolio.warnings + rep.warnings)
+    s = rep.summary
+    typer.echo(
+        f"\nreturn {_pct(s['total_return'])}  CAGR {_pct(s['cagr'])}  volatility "
+        f"{_pct(rep.volatility)}  Sharpe {_num(s['sharpe'])}  max DD {_pct(s['max_drawdown'])}"
+    )
+    c = f"{rep.confidence:.1%}".replace(".0%", "%")
+    typer.echo(f"\n1-day loss at {c} confidence   {'historical':>11}{'normal':>9}")
+    typer.echo(f"{'VaR':<34}{_pct(rep.var_historical):>11}{_pct(rep.var_normal):>9}")
+    typer.echo(
+        f"{'CVaR (average beyond VaR)':<34}{_pct(rep.cvar_historical):>11}"
+        f"{_pct(rep.cvar_normal):>9}"
+    )
+    if rep.beta is not None:
+        b = rep.beta
+        typer.echo(
+            f"\nvs {rep.benchmark}: beta {_num(b.beta)}, alpha {_pct(b.alpha)} a year, "
+            f"correlation {_num(b.correlation)}, R^2 {_num(b.r_squared)}"
+        )
+    typer.echo(f"\n{'symbol':<8}{'weight':>9}{'risk share':>12}{'marginal':>10}")
+    for sym, row in rep.contributions.iterrows():
+        typer.echo(f"{sym:<8}{_pct(row.weight):>9}{_pct(row.percent):>12}{_pct(row.marginal):>10}")
+    _print_alignment_notes(out.notes)
+
+
+@portfolio_app.command("delete")
+def portfolio_delete(name: Annotated[str, typer.Argument(help="Name or id")]) -> None:
+    """Delete a saved portfolio."""
+    record = _analyse(portfolio_service.delete_portfolio, name)
+    typer.echo(f"Deleted {record.name!r} (id {record.id}).")
 
 
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
