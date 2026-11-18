@@ -70,6 +70,7 @@ class IngestionSummary:
     status: RunStatus
     results: list[SymbolResult] = field(default_factory=list)
     end_capped_to: date | None = None  # set when the requested end was after the last final bar
+    source: str = ""  # name of the data source this run used
 
     @property
     def inserted(self) -> int:
@@ -336,5 +337,9 @@ def run_ingestion(
 
     logger.info("ingestion run %d finished: %s", run_id, status.value)
     return IngestionSummary(
-        run_id=run_id, status=status, results=results, end_capped_to=end if capped else None
+        run_id=run_id,
+        status=status,
+        results=results,
+        end_capped_to=end if capped else None,
+        source=source.name,
     )

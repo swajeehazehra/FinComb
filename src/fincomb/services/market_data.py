@@ -9,7 +9,7 @@ from typing import Literal
 import pandas as pd
 from sqlalchemy.orm import Session
 
-from fincomb.db.repositories import PRICE_COLUMNS, PriceRepository
+from fincomb.db.repositories import PRICE_COLUMNS, InstrumentRepository, PriceRepository
 from fincomb.exceptions import InsufficientDataError, SymbolNotFoundError
 
 logger = logging.getLogger(__name__)
@@ -99,3 +99,31 @@ def alignment_warnings(columns: dict[str, pd.Series], aligned: pd.DataFrame) -> 
             "least one symbol has no price on them."
         )
     return msgs
+
+
+def price_bars(
+    session: Session,
+    symbol: str,
+    start: date | None = None,
+    end: date | None = None,
+    adjusted: bool = False,
+) -> pd.DataFrame:
+    """Stored OHLCV bars of one symbol, oldest first.
+
+    Raises SymbolNotFoundError if the symbol is not stored at all; a stored symbol
+    with no bars in [start, end] gives an empty frame.
+
+    adjusted=True scales open, high, low and close by adj_close / close, the same
+    split-and-dividend factor the vendor applied to adj_close, so the whole bar is
+    comparable across time. Volume is returned as reported.
+    """
+    symbol = symbol.strip().upper()
+    if InstrumentRepository(session).get_by_symbol(symbol) is None:
+        raise SymbolNotFoundError(f"{symbol} is not stored; run `fincomb ingest {symbol}` first")
+    bars = PriceRepository(session).get_bars(symbol, start, end)
+    if adjusted and not bars.empty:
+        factor = bars["adj_close"] / bars["close"]
+        bars = bars.copy()
+        for col in ("open", "high", "low", "close"):
+            bars[col] = bars[col] * factor
+    return bars

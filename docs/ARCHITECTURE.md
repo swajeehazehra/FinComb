@@ -1,6 +1,8 @@
 # FinComb: Financial Intelligence & Quantitative Research Platform
 
-**Design document, v0.1 (approved). Milestone 1 implemented.**
+**Design document, v0.2. Milestones 1 to 3 implemented** (data pipeline, analytics core, REST API).
+
+Changes since v0.1: Stooq was replaced by Tiingo as the fallback source (Stooq now requires an API key and a browser check); each symbol has one owning data source ([DATA_INTEGRITY.md](DATA_INTEGRITY.md)); the API section below describes what Milestone 3 actually built.
 
 Python package name: `fincomb`.
 
@@ -12,7 +14,7 @@ Python package name: `fincomb`.
 
 1. **Layers only depend downward.** The dashboard never touches the database, and the quant code never touches the database or HTTP. That makes the maths testable as pure functions.
 2. **Pure quant core.** Everything in `analytics/`, `portfolio/`, `strategies/` and `backtest/` takes pandas objects in and returns pandas objects / dataclasses out. No I/O, no globals, no randomness without an explicit seed.
-3. **Pluggable data sources.** One `MarketDataSource` interface; yfinance is the default, Stooq is the fallback, and a CSV adapter feeds tests so the test suite never hits the network.
+3. **Pluggable data sources.** One `MarketDataSource` interface; yfinance is the default, Tiingo (free API key) is the fallback, and a CSV adapter feeds tests so the test suite never hits the network.
 4. **Reproducible by construction.** Every backtest run stores its parameters, the code version (git SHA), and a hash of the exact price data it used.
 5. **Configuration from environment.** `pydantic-settings` reads `.env` / env vars. No credentials in code; `.env` is git-ignored and `.env.example` documents every variable.
 
@@ -53,7 +55,7 @@ Python package name: `fincomb`.
 | ORM / migrations | SQLAlchemy 2.0 + Alembic | Industry standard, typed, versioned schema |
 | Config | pydantic-settings | Typed env-var config, fails fast on missing values |
 | API | FastAPI + Pydantic v2 | Auto OpenAPI docs at `/docs`, request validation |
-| Data source | yfinance (default), Stooq via pandas-datareader (fallback) | Free, no API key; adapter pattern isolates breakage |
+| Data source | yfinance (default), Tiingo REST API (fallback, free key) | Free; adapter pattern isolates breakage. Each symbol is owned by one source so histories are never mixed |
 | Optimisation | SciPy `minimize` (SLSQP) | Constrained min-variance / max-Sharpe without extra deps |
 | Statistics | Statsmodels | OLS beta/alpha vs benchmark, ADF test for mean-reversion |
 | Charts | Plotly | Same figures work in Streamlit and notebooks |
@@ -84,6 +86,7 @@ PostgreSQL 16. Prices are stored as `DOUBLE PRECISION` (analytics run in float64
 | exchange | VARCHAR(20) | |
 | currency | CHAR(3) DEFAULT 'USD' | |
 | is_active | BOOLEAN DEFAULT true | |
+| data_source | VARCHAR(20) | the one source that owns this symbol's history (migration 0002) |
 | created_at | TIMESTAMPTZ DEFAULT now() | |
 
 ### 2.2 Market data
@@ -97,7 +100,7 @@ PostgreSQL 16. Prices are stored as `DOUBLE PRECISION` (analytics run in float64
 | open, high, low, close | DOUBLE PRECISION NOT NULL | raw (unadjusted) |
 | adj_close | DOUBLE PRECISION NOT NULL | split + dividend adjusted |
 | volume | BIGINT | |
-| source | VARCHAR(20) NOT NULL | `yfinance`, `stooq`, `csv` |
+| source | VARCHAR(20) NOT NULL | `yfinance`, `tiingo`, `csv` |
 | ingested_at | TIMESTAMPTZ DEFAULT now() | |
 | ingestion_run_id | INT FK → ingestion_runs | lineage |
 
@@ -106,7 +109,7 @@ PostgreSQL 16. Prices are stored as `DOUBLE PRECISION` (analytics run in float64
 
 ### 2.3 Data pipeline audit
 
-**`ingestion_runs`**: id, source, symbols TEXT[], start_date, end_date, started_at, finished_at, status ENUM(`running`,`success`,`partial`,`failed`), rows_inserted, rows_rejected, error_message.
+**`ingestion_runs`**: id, source, symbols TEXT[], start_date, end_date, started_at, finished_at, status ENUM(`running`,`success`,`partial`,`failed`), rows_inserted, rows_updated, rows_rejected, error_message.
 
 **`data_quality_issues`**: id, ingestion_run_id FK, instrument_id FK, bar_date, rule (e.g. `non_positive_price`, `ohlc_inconsistent`, `extreme_return`, `stale_price`, `gap`), severity ENUM(`warning`,`error`), detail TEXT. Errors are rejected, warnings are stored and flagged.
 
@@ -173,8 +176,11 @@ FinComb/
 │   ├── ingestion/
 │   │   ├── base.py             # MarketDataSource protocol
 │   │   ├── yfinance_source.py
-│   │   ├── stooq_source.py
+│   │   ├── tiingo_source.py    # fallback, needs TIINGO_API_KEY
 │   │   ├── csv_source.py       # offline / tests
+│   │   ├── registry.py         # source by name
+│   │   ├── calendar.py         # last completed trading session
+│   │   ├── audit.py            # `check-data` / GET /data/audit
 │   │   └── pipeline.py         # fetch → validate → upsert → audit
 │   ├── validation/
 │   │   └── rules.py            # data-quality rules returning issues
@@ -195,17 +201,19 @@ FinComb/
 │   │   ├── costs.py            # commission + slippage models
 │   │   └── report.py           # metrics + benchmark comparison
 │   ├── services/               # orchestration used by API and CLI
-│   │   ├── market_data.py
-│   │   ├── analytics_service.py
+│   │   ├── market_data.py      # load_prices (aligned wide frame), price_bars
+│   │   ├── ingestion_service.py # choose source per symbol, run the pipeline
+│   │   ├── analytics_service.py # load prices → analytics, with alignment notes
 │   │   ├── portfolio_service.py
 │   │   └── backtest_service.py
 │   ├── api/
-│   │   ├── main.py             # app factory, middleware, error handlers
-│   │   ├── deps.py             # DB session dependency
+│   │   ├── main.py             # create_app(settings, session_factory) factory
+│   │   ├── deps.py             # settings, session per request, date range, symbols
+│   │   ├── errors.py           # exception → HTTP status + error JSON, one table
 │   │   ├── schemas/            # Pydantic request/response models
 │   │   └── routers/            # health, instruments, prices, analytics,
 │   │                           # portfolios, strategies, backtests, ingestion
-│   └── cli.py                  # `fincomb ingest`, `fincomb backtest`
+│   └── cli.py                  # `fincomb ingest`, `fincomb serve`, … (thin: calls services)
 ├── dashboard/
 │   ├── app.py                  # Streamlit entry
 │   ├── api_client.py           # thin httpx wrapper
@@ -223,32 +231,59 @@ FinComb/
 
 ## 4. API endpoints
 
-Base path `/api/v1`. All responses JSON; errors use one shape: `{"error": {"code": "...", "message": "...", "details": {...}}}`. Dates are ISO `YYYY-MM-DD`.
+Base path `/api/v1`. All responses JSON. Interactive docs at `/docs` (Swagger UI) and `/redoc`; the schema is at `/api/v1/openapi.json`. Run locally with `fincomb serve` (binds to 127.0.0.1 by default).
+
+**Conventions**
+
+- Dates are ISO `YYYY-MM-DD`; `start`/`end` are inclusive and `start > end` is a 422.
+- `symbols` is comma-separated (`symbols=AAPL,MSFT`) or repeated (`symbols=AAPL&symbols=MSFT`), at most 50 per analytics request.
+- Multi-symbol analytics use **inner alignment** by default (dates every symbol has). Every analytics response has a `notes` list explaining when that shortened the period; `align=outer` analyses each symbol over its own history.
+- Statistics that are undefined (e.g. Sharpe with zero volatility) are `null`; JSON never contains NaN.
+- Time series are column-oriented: `{"dates": [...], "series": {"AAPL": [...]}}`.
+- Routes are synchronous (`def`): SQLAlchemy is synchronous, so FastAPI runs them in its thread pool.
+
+**Errors** always look like `{"error": {"code": "...", "message": "...", "details": {...}}}`. Domain exceptions are mapped in one table (`api/errors.py`):
+
+| Exception / case | HTTP | code |
+|---|---|---|
+| `SymbolNotFoundError` (no stored prices) | 404 | `symbol_not_found` |
+| unknown instrument / run, unknown route | 404 | `not_found` |
+| symbol already registered | 409 | `already_exists` |
+| `DataOwnershipError` | 409 | `data_ownership_conflict` |
+| bad query/body, `ValueError` from analytics | 422 | `invalid_request` |
+| `InsufficientDataError` / `MissingDataError` | 422 | `insufficient_data` / `missing_data` |
+| `DataSourceError` / `DataSourceAuthError` | 502 / 503 | `data_source_error` / `data_source_auth` |
+| database unreachable | 503 | `database_unavailable` |
+| anything else | 500 | `internal_error` (details only in the server log) |
 
 ### System
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/health` | Liveness + DB connectivity |
+| GET | `/health` | Liveness + DB connectivity + Alembic revision (503 if the DB is unreachable) |
 
 ### Instruments & data
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/instruments` | List (filter `asset_type`, `active`) |
-| POST | `/instruments` | Register a symbol |
-| GET | `/instruments/{symbol}` | Detail + data coverage (first/last date, bar count) |
-| GET | `/prices/{symbol}` | Bars; query `start`, `end`, `adjusted=true` |
-| POST | `/ingestion/runs` | Ingest `{symbols, start, end, source}`; returns run summary |
-| GET | `/ingestion/runs` | Recent runs |
+| POST | `/instruments` | Register a symbol `{symbol, asset_type, name}` without downloading (201; 409 if it exists) |
+| GET | `/instruments/{symbol}` | Detail + owning source + coverage (first/last date, bar count) |
+| PATCH | `/instruments/{symbol}` | Change `asset_type` (same as `fincomb set-type`) |
+| GET | `/prices/{symbol}` | Bars; query `start`, `end`, `adjusted` (true = OHLC scaled by `adj_close / close`) |
+| POST | `/ingestion/runs` | Ingest `{symbols, start, end, source, mode, asset_type}` synchronously; returns one run summary per source used (201) |
+| GET | `/ingestion/runs` | Recent runs, newest first (`limit`, default 20) |
 | GET | `/ingestion/runs/{id}` | Run detail incl. data-quality issues |
+| GET | `/data/audit` | Same checks as `fincomb check-data` |
+
+`POST /ingestion/runs` follows the pipeline's rules exactly: each symbol keeps its owning source unless `source` is given; `mode=refresh` replaces the whole history from one source (and is how ownership is switched); the end date is capped to the last completed session (`end_capped_to`). One bad symbol never fails the others, so a per-symbol problem such as an ownership conflict is reported in `results[].error` and the run `status` (`partial` / `failed`), not as an HTTP error. A request may name at most 20 symbols, because downloads run inside the request.
 
 ### Analytics
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/analytics/performance` | `symbols`, `start`, `end`, `risk_free` → total return, CAGR, ann. vol, Sharpe, Sortino, max drawdown, Calmar per symbol |
-| GET | `/analytics/returns` | Return series (`frequency=daily|weekly|monthly`, `cumulative=bool`) |
-| GET | `/analytics/drawdown/{symbol}` | Drawdown series + worst episodes |
-| GET | `/analytics/rolling` | Rolling vol / Sharpe (`window`) |
-| GET | `/analytics/correlation` | Correlation matrix (`method=pearson|spearman`) |
+| GET | `/analytics/performance` | `symbols`, `start`, `end`, `risk_free`, `align` → total return, CAGR, ann. vol, Sharpe, Sortino, max drawdown, Calmar, best/worst day per symbol |
+| GET | `/analytics/returns` | Return series (`frequency=daily|weekly|monthly|yearly`, `cumulative=bool`, `align`) |
+| GET | `/analytics/drawdown/{symbol}` | Drawdown series + worst `top` episodes |
+| GET | `/analytics/rolling` | Rolling vol / Sharpe (`metric`, `window`, default 63 / 252 days) |
+| GET | `/analytics/correlation` | Correlation matrix (`method=pearson|spearman`, `align`) |
 
 ### Portfolios
 | Method | Path | Purpose |
@@ -306,9 +341,9 @@ Each milestone ends with: code, explanation, exact commands, tests passing, and 
 
 | # | Milestone | Deliverables | "Done" means |
 |---|---|---|---|
-| **1** | **Foundation + data pipeline** | Repo scaffold, `pyproject.toml`, config, logging, Docker Compose Postgres, SQLAlchemy models, first Alembic migration, `MarketDataSource` + yfinance/Stooq/CSV adapters, validation rules, idempotent upsert, ingestion audit, `fincomb ingest` CLI | `docker compose up db` + `fincomb ingest AAPL MSFT SPY --start 2015-01-01` fills Postgres; re-running inserts no duplicates; unit tests for validation, integration test for upsert |
-| 2 | Analytics core | `returns.py`, `risk.py`, `correlation.py` as pure functions | Metrics match hand-computed fixtures and known values; property tests (e.g. MDD ∈ [−1, 0]) |
-| 3 | FastAPI backend | App factory, error handling, routers for health/instruments/prices/ingestion/analytics, Pydantic schemas | OpenAPI docs live; integration tests via `TestClient` against test Postgres |
+| **1** ✅ | **Foundation + data pipeline** | Repo scaffold, `pyproject.toml`, config, logging, Docker Compose Postgres, SQLAlchemy models, first Alembic migration, `MarketDataSource` + yfinance/Tiingo/CSV adapters (Stooq dropped), validation rules, idempotent upsert, ingestion audit, `fincomb ingest` CLI | `docker compose up db` + `fincomb ingest AAPL MSFT SPY --start 2015-01-01` fills Postgres; re-running inserts no duplicates; unit tests for validation, integration test for upsert |
+| **2** ✅ | **Analytics core** | `returns.py`, `risk.py`, `correlation.py` as pure functions | Metrics match hand-computed fixtures and known values; property tests (e.g. MDD ∈ [−1, 0]) |
+| **3** ✅ | **FastAPI backend** | App factory, error handling, routers for health/instruments/prices/ingestion/analytics, Pydantic schemas | OpenAPI docs live; integration tests via `TestClient` against test Postgres |
 | 4 | Portfolio construction & risk | Weight methods, risk metrics, portfolio endpoints | Weights sum to 1, respect bounds; min-var ≤ equal-weight variance on fixture data |
 | 5 | Strategies + backtest engine | Strategy ABC, momentum, mean reversion, buy-and-hold, engine with costs/slippage, benchmark report, persisted runs, backtest endpoints | Look-ahead perturbation test passes; buy-and-hold matches benchmark return exactly with zero costs |
 | 6 | Streamlit dashboard | Pages: Market data, Performance, Correlation heatmap, Portfolio builder, Backtest lab | Runs in Docker against the API; no direct DB access |
@@ -322,7 +357,7 @@ Stretch (only if time allows): async job queue for long backtests, walk-forward 
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| **yfinance is unofficial and breaks / rate-limits** | Ingestion fails, demos break | Adapter interface + Stooq fallback; retry with backoff; checked-in CSV fixtures so tests and demos never need the network |
+| **yfinance is unofficial and breaks / rate-limits** | Ingestion fails, demos break | Adapter interface + Tiingo fallback; retry with backoff; checked-in CSV fixtures so tests and demos never need the network |
 | **Look-ahead bias** | Backtests look unrealistically good, which reviewers will spot | Single shift point in engine; perturbation test per strategy; documented in METHODOLOGY.md |
 | **Survivorship bias** | Universe of today's tickers overstates past returns | Acknowledge explicitly in docs; let users pick universes; delisted-data is out of scope for a free source |
 | **Adjusted vs raw prices** | Splits/dividends distort returns | Store both; analytics use `adj_close`; validation flags >40% one-day moves for review |
