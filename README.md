@@ -1,15 +1,15 @@
 # FinComb
 
 An end-to-end financial intelligence and quantitative research platform: it ingests
-and validates market data, stores it in PostgreSQL, and (in later milestones) analyses
-performance and risk, optimises portfolios and backtests trading strategies without
-look-ahead bias.
+and validates market data, stores it in PostgreSQL, analyses performance and risk, serves it all through a REST
+API, and (in later milestones) optimises portfolios and backtests trading strategies
+without look-ahead bias.
 
 Tech stack: Python · PostgreSQL · SQLAlchemy · Alembic · FastAPI · pandas / NumPy ·
 SciPy / Statsmodels · Plotly · Streamlit · Pytest · Docker
 
-> Status: **Milestone 2 of 7 done** (data pipeline and analytics core). See the
-> [roadmap](#roadmap).
+> Status: **Milestone 3 of 7 done** (data pipeline, analytics core and REST API). See
+> the [roadmap](#roadmap).
 
 ## What works today
 
@@ -32,6 +32,10 @@ SciPy / Statsmodels · Plotly · Streamlit · Pytest · Docker
   and drawdown episodes, Calmar, rolling statistics and correlation matrices, as
   pure, tested functions. Conventions are documented in
   [docs/METHODOLOGY.md](docs/METHODOLOGY.md).
+- **REST API** (FastAPI): instruments, prices, ingestion runs, data audit and all
+  analytics as JSON, with interactive OpenAPI docs at `/docs`, one error format and
+  no business logic in the routes (they call the same services as the CLI). See
+  [docs/MILESTONE_3.md](docs/MILESTONE_3.md).
 
 ## Quick start
 
@@ -54,7 +58,24 @@ fincomb analyze AAPL MSFT SPY --risk-free 0.04
 fincomb correlation AAPL MSFT SPY
 fincomb drawdowns SPY
 pytest
+fincomb serve                     # API on http://127.0.0.1:8000, docs at /docs
 ```
+
+## REST API
+
+`fincomb serve` starts the API on `127.0.0.1:8000` (this computer only; the write
+endpoints have no authentication yet). Open <http://127.0.0.1:8000/docs> to try
+every endpoint in the browser. A few examples:
+
+```bash
+curl "http://127.0.0.1:8000/api/v1/health"
+curl "http://127.0.0.1:8000/api/v1/instruments/AAPL"
+curl "http://127.0.0.1:8000/api/v1/analytics/performance?symbols=AAPL,MSFT,SPY&risk_free=0.04"
+curl "http://127.0.0.1:8000/api/v1/analytics/correlation?symbols=SPY,QQQ,TLT,GLD"
+```
+
+Errors always have the shape `{"error": {"code", "message", "details"}}`. The full
+endpoint list is in [docs/ARCHITECTURE.md §4](docs/ARCHITECTURE.md#4-api-endpoints).
 
 ## Project layout
 
@@ -66,8 +87,9 @@ src/fincomb/
   ingestion/           MarketDataSource + yfinance, tiingo, csv adapters, pipeline
   validation/          data-quality rules
   analytics/           returns, risk, correlation (pure functions, no I/O)
-  services/            loads stored prices for the analytics
-  cli.py               `fincomb` command
+  services/            shared by CLI and API: load prices, run analytics, run ingestion
+  api/                 FastAPI app factory, routers, Pydantic schemas, error mapping
+  cli.py               `fincomb` command (thin: parses arguments, calls services)
 migrations/            Alembic schema migrations
 tests/unit/            fast tests, no database, no network
 tests/integration/     tests against a real PostgreSQL test database
@@ -79,7 +101,7 @@ docs/                  architecture and milestone guides
 
 1. ✅ Foundation and data pipeline
 2. ✅ Analytics core: returns, volatility, Sharpe, drawdown, correlation
-3. FastAPI backend
+3. ✅ FastAPI backend: REST API over the data and analytics
 4. Portfolio construction and risk
 5. Strategies (momentum, mean reversion) and a backtest engine with costs and slippage
 6. Streamlit dashboard
