@@ -245,7 +245,12 @@ and R² are reported too. A zero-variance benchmark gives null beta.
 **Risk contributions** (annualised, Euler decomposition): marginal
 $\text{MCR}_i = (\Sigma w)_i/\sigma_p$, component $\text{CR}_i = w_i\,\text{MCR}_i$
 (they sum exactly to $\sigma_p$), and percentage $\text{CR}_i/\sigma_p$ (sums to
-100%). A negative contribution means the asset lowers total risk. The report uses
+100%). A negative contribution means the asset lowers total risk. An asset that
+never moved contributes exactly 0. If the portfolio's own daily volatility is at
+or below the same $10^{-12}$ tolerance the Sharpe ratio uses (checked on the daily
+figure, before annualising), there is no risk to divide up: the contributions are
+undefined (null in the API, n/a in the CLI) and the report says why. A covariance
+with NaN or infinite entries is rejected. The report uses
 the plain sample covariance of the analysis period, since it describes what
 happened; shrinkage only helps the optimiser.
 

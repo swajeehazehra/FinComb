@@ -16,6 +16,7 @@ import pandas as pd
 from fincomb.analytics._utils import check_prices
 from fincomb.analytics.constants import TRADING_DAYS
 from fincomb.analytics.returns import simple_returns
+from fincomb.analytics.risk import _ZERO as ZERO_STD  # one zero tolerance everywhere
 from fincomb.analytics.risk import (
     BetaResult,
     beta_alpha,
@@ -91,22 +92,32 @@ def risk_contributions(
     marginal_i  = (S w)_i / sigma_p      extra volatility per unit of weight
     component_i = w_i * marginal_i       sums exactly to sigma_p
     percent_i   = component_i / sigma_p  sums to 1; negative = the asset reduces risk
+
+    `cov` is the per-period (daily) covariance. When the portfolio's per-period
+    volatility is at or below the analytics zero tolerance (1e-12, the same one the
+    Sharpe ratio uses), the decomposition is undefined: marginal, component and
+    percent are NaN rather than ratios of rounding noise. A covariance with NaN or
+    infinite entries is rejected.
     """
     weights = check_weights(weights)
-    s = cov.loc[weights.index, weights.index].to_numpy(dtype="float64") * periods_per_year
+    daily = cov.loc[weights.index, weights.index].to_numpy(dtype="float64")
+    if not np.all(np.isfinite(daily)):
+        raise ValueError("the covariance matrix contains NaN or infinite values")
     w = weights.to_numpy()
-    var = float(w @ s @ w)
-    vol = np.sqrt(var) if var > 0 else float("nan")
-    sw = s @ w
-    marginal = sw / vol
-    component = w * marginal
+    # Compare the DAILY volatility with the tolerance, then annualise: the tolerance is
+    # defined per period, like the standard deviations it guards elsewhere.
+    daily_vol = np.sqrt(max(float(w @ daily @ w), 0.0))
+    if daily_vol <= ZERO_STD:
+        undefined = np.full(len(w), np.nan)
+        marginal = component = percent = undefined
+    else:
+        s = daily * periods_per_year
+        vol = daily_vol * np.sqrt(periods_per_year)
+        marginal = (s @ w) / vol
+        component = w * marginal
+        percent = component / vol
     return pd.DataFrame(
-        {
-            "weight": w,
-            "marginal": marginal,
-            "component": component,
-            "percent": component / vol,
-        },
+        {"weight": w, "marginal": marginal, "component": component, "percent": percent},
         index=pd.Index(weights.index, name="symbol"),
     )
 
@@ -155,6 +166,13 @@ def risk_report(
         beta = beta_alpha(r_p, bench_r, risk_free, periods_per_year)
 
     warnings: list[str] = []
+    contributions = risk_contributions(weights, sample_covariance(returns), periods_per_year)
+    if contributions["component"].isna().all():
+        warnings.append(
+            "Risk contributions are undefined because the portfolio's volatility is "
+            "effectively zero (daily standard deviation at or below 1e-12): there is no "
+            "risk to divide between the assets."
+        )
     tail = tail_observations(r_p, confidence)
     if tail < MIN_TAIL_OBSERVATIONS:
         warnings.append(
@@ -178,6 +196,6 @@ def risk_report(
         tail_observations=tail,
         benchmark=benchmark,
         beta=beta,
-        contributions=risk_contributions(weights, sample_covariance(returns), periods_per_year),
+        contributions=contributions,
         warnings=warnings,
     )

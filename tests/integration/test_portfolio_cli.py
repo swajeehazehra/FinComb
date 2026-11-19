@@ -100,3 +100,15 @@ def test_cli_and_api_give_the_same_numbers(cli, session_factory, fixtures_dir):
     out = run(cli, "risk", "same", "--benchmark", "SYNM").output
     assert f"{expected.var_historical * 100:,.2f}%" in out
     assert f"beta {expected.beta.beta:,.2f}" in out
+
+
+def test_zero_volatility_portfolio_prints_na_and_the_warning(cli, session_factory):
+    from tests.integration.test_portfolio_api import _add_flat_symbol
+
+    _add_flat_symbol(session_factory)
+    assert run(cli, "create", "cash", "--weights", "FLAT=1").exit_code == 0
+    res = run(cli, "risk", "cash", "--benchmark", "")
+    assert res.exit_code == 0, res.output
+    assert "WARNING: Risk contributions are undefined" in res.output
+    row = next(line for line in res.output.splitlines() if line.startswith("FLAT"))
+    assert row.split() == ["FLAT", "100.00%", "n/a", "n/a"]

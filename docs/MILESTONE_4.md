@@ -87,8 +87,8 @@ fincomb check-db              # Schema revision: 0003_portfolios
 pytest
 ```
 
-Expected: **330 passed** (212 from before, plus 118 new). Without the database,
-106 integration tests are skipped instead (`224 passed, 106 skipped`). Only the
+Expected: **342 passed** (212 from before, plus 130 new). Without the database,
+107 integration tests are skipped instead (`235 passed, 107 skipped`). Only the
 portfolio and risk tests:
 
 ```powershell

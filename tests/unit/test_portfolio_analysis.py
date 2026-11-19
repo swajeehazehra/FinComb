@@ -135,3 +135,102 @@ def test_portfolio_volatility_identity():
     cov = prices.pct_change().iloc[1:].cov().to_numpy()
     rep = PA.risk_report(prices, w)
     assert rep.volatility == pytest.approx(np.sqrt(w @ cov @ w * 252))
+
+
+# --- risk contributions: zero volatility and non-finite input --------------------------------
+
+
+def _cov(rows, symbols):
+    return pd.DataFrame(rows, index=symbols, columns=symbols, dtype="float64")
+
+
+FLAT_COV = _cov(
+    [[4e-4, 1e-4, 0.0], [1e-4, 1e-4, 0.0], [0.0, 0.0, 0.0]], ["A", "B", "FLAT"]
+)  # FLAT never moves: its row and column are zero
+
+
+def test_zero_volatility_asset_with_weight_contributes_nothing():
+    rc = PA.risk_contributions(_weights({"A": 0.4, "B": 0.3, "FLAT": 0.3}), FLAT_COV)
+    assert rc.loc["FLAT", ["marginal", "component", "percent"]].tolist() == [0.0, 0.0, 0.0]
+    w = np.array([0.4, 0.3, 0.3])
+    vol = np.sqrt(w @ FLAT_COV.to_numpy() @ w * 252)
+    assert rc["component"].sum() == pytest.approx(vol, rel=1e-12)
+    assert rc["percent"].sum() == pytest.approx(1.0, abs=1e-12)
+    assert rc.loc[["A", "B"], "percent"].sum() == pytest.approx(1.0, abs=1e-12)
+
+
+def test_zero_weight_asset_keeps_a_meaningful_marginal():
+    rc = PA.risk_contributions(_weights({"A": 0.5, "B": 0.5, "FLAT": 0.0}), FLAT_COV)
+    assert rc.loc["FLAT", "component"] == 0.0 and rc.loc["FLAT", "percent"] == 0.0
+    assert rc.loc["FLAT", "marginal"] == 0.0  # uncorrelated, riskless: adding it adds no risk
+    # A zero-weight RISKY asset: component 0, but its marginal is finite and positive.
+    rc2 = PA.risk_contributions(
+        _weights({"A": 1.0, "B": 0.0}), FLAT_COV.loc[["A", "B"], ["A", "B"]]
+    )
+    assert rc2.loc["B", "component"] == 0.0 and rc2.loc["B", "percent"] == 0.0
+    # (S w)_B / sigma_p = 1e-4 * 252 / sqrt(4e-4 * 252)
+    assert rc2.loc["B", "marginal"] == pytest.approx(1e-4 * 252 / np.sqrt(4e-4 * 252))
+    assert rc2["percent"].sum() == pytest.approx(1.0)
+
+
+def test_exactly_zero_portfolio_volatility_is_undefined():
+    rc = PA.risk_contributions(_weights({"FLAT": 1.0}), FLAT_COV)
+    assert rc.loc["FLAT", "weight"] == 1.0
+    assert rc[["marginal", "component", "percent"]].isna().all().all()
+
+
+def test_rounding_noise_volatility_is_undefined():
+    # Prices growing by a constant 0.04% / 0.02% a day: the true covariance is zero, but
+    # floating-point rounding leaves entries around 1e-32 (daily std about 1e-16).
+    idx = pd.bdate_range("2023-01-02", periods=80)
+    prices = pd.DataFrame(
+        {"G": 100 * 1.0004 ** np.arange(80), "H": 50 * 1.0002 ** np.arange(80)}, index=idx
+    )
+    cov = prices.pct_change().iloc[1:].cov()
+    assert 0 < np.abs(cov.to_numpy()).max() < 1e-24  # noise, not exactly zero
+    rc = PA.risk_contributions(_weights({"G": 0.5, "H": 0.5}), cov)
+    assert rc[["marginal", "component", "percent"]].isna().all().all()
+    # Consistent with the analytics module, whose Sharpe ratio is NaN for the same series.
+    assert np.isnan(risk.sharpe_ratio(prices.pct_change().iloc[1:] @ np.array([0.5, 0.5])))
+
+
+def test_tolerance_is_applied_to_daily_not_annual_volatility():
+    # Daily std 2e-12 (just above the 1e-12 tolerance) is defined, even though the
+    # annualised figure would be about 3.2e-11; daily std 5e-13 is undefined.
+    above = PA.risk_contributions(_weights({"A": 1.0}), _cov([[(2e-12) ** 2]], ["A"]))
+    assert above.loc["A", "percent"] == pytest.approx(1.0)
+    assert above.loc["A", "component"] == pytest.approx(2e-12 * np.sqrt(252))
+    below = PA.risk_contributions(_weights({"A": 1.0}), _cov([[(5e-13) ** 2]], ["A"]))
+    assert below[["marginal", "component", "percent"]].isna().all().all()
+    # Annualisation changes the numbers, not the decision: 12 periods a year, same answer.
+    monthly = PA.risk_contributions(
+        _weights({"A": 1.0}), _cov([[(5e-13) ** 2]], ["A"]), periods_per_year=12
+    )
+    assert monthly["percent"].isna().all()
+
+
+@pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf])
+def test_non_finite_covariance_is_rejected(bad):
+    cov = FLAT_COV.copy()
+    cov.loc["A", "B"] = cov.loc["B", "A"] = bad
+    with pytest.raises(ValueError, match="NaN or infinite"):
+        PA.risk_contributions(_weights({"A": 0.5, "B": 0.5, "FLAT": 0.0}), cov)
+
+
+def test_non_finite_entries_outside_the_portfolio_are_ignored():
+    cov = FLAT_COV.copy()
+    cov.loc["FLAT", "FLAT"] = np.nan  # not in the weights below
+    rc = PA.risk_contributions(_weights({"A": 0.5, "B": 0.5}), cov)
+    assert rc["percent"].sum() == pytest.approx(1.0)
+
+
+def test_risk_report_warns_when_portfolio_volatility_is_zero():
+    idx = pd.bdate_range("2023-01-02", periods=80)
+    prices = pd.DataFrame({"FLAT": 10.0, "A": 100 * 1.01 ** np.sin(np.arange(80))}, index=idx)
+    flat = PA.risk_report(prices, _weights({"FLAT": 1.0}))
+    assert flat.contributions[["marginal", "component", "percent"]].isna().all().all()
+    assert any("effectively zero" in w for w in flat.warnings)
+    mixed = PA.risk_report(prices, _weights({"FLAT": 0.5, "A": 0.5}))
+    assert not any("effectively zero" in w for w in mixed.warnings)
+    assert mixed.contributions.loc["FLAT", "percent"] == 0.0
+    assert mixed.contributions.loc["A", "percent"] == pytest.approx(1.0)

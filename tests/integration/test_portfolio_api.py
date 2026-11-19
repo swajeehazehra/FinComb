@@ -5,12 +5,14 @@ from __future__ import annotations
 import json
 from datetime import date
 
+import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 
 from fincomb.api.main import API_PREFIX, create_app
 from fincomb.config import get_settings
 from fincomb.db.base import session_scope
+from fincomb.db.repositories import InstrumentRepository, PriceRepository
 from fincomb.ingestion.csv_source import CsvSource
 from fincomb.ingestion.pipeline import run_ingestion
 from fincomb.services import portfolio_service as svc
@@ -200,3 +202,38 @@ def test_openapi_lists_portfolio_routes(client):
         "/portfolios/{portfolio_id}/risk",
     ):
         assert f"{API_PREFIX}{path}" in paths
+
+
+def _add_flat_symbol(factory, symbol="FLAT"):
+    """A symbol whose price never moves, on the same dates as the fixtures."""
+    idx = pd.bdate_range("2023-01-02", "2023-12-29", name="date")
+    bars = pd.DataFrame(
+        {"open": 10.0, "high": 10.0, "low": 10.0, "close": 10.0, "adj_close": 10.0, "volume": 1},
+        index=idx,
+    )
+    with session_scope(factory) as s:
+        inst = InstrumentRepository(s).get_or_create(symbol)
+        inst.data_source = "csv"
+        PriceRepository(s).upsert_bars(inst.id, bars, "csv", None)
+
+
+def test_zero_volatility_portfolio_serialises_null_contributions(client, session_factory):
+    _add_flat_symbol(session_factory)
+    res = client.post(f"{P}/risk", json={"weights": {"FLAT": 1.0}, "benchmark": None})
+    assert res.status_code == 200, res.text
+    _no_nan(res)
+    body = res.json()
+    (row,) = body["contributions"]
+    assert row["weight"] == 1.0
+    assert row["marginal_risk"] is None
+    assert row["risk_contribution"] is None
+    assert row["percent_of_risk"] is None
+    assert any("effectively zero" in w for w in body["warnings"])
+    # A flat asset inside a risky portfolio keeps its exact zero contribution.
+    mixed = client.post(
+        f"{P}/risk", json={"weights": {"FLAT": 0.5, "SYNA": 0.5}, "benchmark": None}
+    ).json()
+    by_symbol = {c["symbol"]: c for c in mixed["contributions"]}
+    assert by_symbol["FLAT"]["percent_of_risk"] == 0.0
+    assert by_symbol["SYNA"]["percent_of_risk"] == pytest.approx(1.0)
+    assert not any("effectively zero" in w for w in mixed["warnings"])
