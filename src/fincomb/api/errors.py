@@ -27,6 +27,8 @@ from fincomb.exceptions import (
     FinCombError,
     InsufficientDataError,
     MissingDataError,
+    PortfolioExistsError,
+    PortfolioNotFoundError,
     SymbolNotFoundError,
     ValidationError,
 )
@@ -55,6 +57,8 @@ def not_found(what: str, key: object) -> ApiError:
 # MRO), but the table reads better that way.
 DOMAIN_ERRORS: dict[type[FinCombError], tuple[int, str]] = {
     SymbolNotFoundError: (404, "symbol_not_found"),
+    PortfolioNotFoundError: (404, "not_found"),
+    PortfolioExistsError: (409, "already_exists"),
     DataOwnershipError: (409, "data_ownership_conflict"),
     InsufficientDataError: (422, "insufficient_data"),
     MissingDataError: (422, "missing_data"),

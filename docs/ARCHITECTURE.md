@@ -1,8 +1,10 @@
 # FinComb: Financial Intelligence & Quantitative Research Platform
 
-**Design document, v0.2. Milestones 1 to 3 implemented** (data pipeline, analytics core, REST API).
+**Design document, v0.3. Milestones 1 to 4 implemented** (data pipeline, analytics core, REST API, portfolio construction and risk).
 
 Changes since v0.1: Stooq was replaced by Tiingo as the fallback source (Stooq now requires an API key and a browser check); each symbol has one owning data source ([DATA_INTEGRITY.md](DATA_INTEGRITY.md)); the API section below describes what Milestone 3 actually built.
+
+Changes in v0.3 (Milestone 4): the portfolio tables in §2.4 are long-only and record the requested and effective method, the construction parameters and the estimation window; `rebalance_frequency` moved to Milestone 5; `portfolio/` gained `covariance.py` and `optimizer.py`; `POST /portfolios/risk` was added for unsaved weights; beta uses the closed-form OLS slope (Statsmodels arrives with Milestone 5).
 
 Python package name: `fincomb`.
 
@@ -57,7 +59,7 @@ Python package name: `fincomb`.
 | API | FastAPI + Pydantic v2 | Auto OpenAPI docs at `/docs`, request validation |
 | Data source | yfinance (default), Tiingo REST API (fallback, free key) | Free; adapter pattern isolates breakage. Each symbol is owned by one source so histories are never mixed |
 | Optimisation | SciPy `minimize` (SLSQP) | Constrained min-variance / max-Sharpe without extra deps |
-| Statistics | Statsmodels | OLS beta/alpha vs benchmark, ADF test for mean-reversion |
+| Statistics | NumPy closed form (Milestone 4), Statsmodels (Milestone 5) | OLS beta/alpha vs benchmark; t-statistics and the ADF test for mean reversion |
 | Charts | Plotly | Same figures work in Streamlit and notebooks |
 | Logging | stdlib `logging` with JSON formatter option | No extra deps; structured logs in Docker |
 | Tests | Pytest, pytest-cov, Hypothesis (property tests) | Unit tests on pure core, integration tests on a real Postgres |
@@ -113,11 +115,22 @@ PostgreSQL 16. Prices are stored as `DOUBLE PRECISION` (analytics run in float64
 
 **`data_quality_issues`**: id, ingestion_run_id FK, instrument_id FK, bar_date, rule (e.g. `non_positive_price`, `ohlc_inconsistent`, `extreme_return`, `stale_price`, `gap`), severity ENUM(`warning`,`error`), detail TEXT. Errors are rejected, warnings are stored and flagged.
 
-### 2.4 Portfolios
+### 2.4 Portfolios (migration 0003)
 
-**`portfolios`**: id, name UNIQUE, description, construction_method (`manual`, `equal_weight`, `inverse_vol`, `min_variance`, `max_sharpe`), rebalance_frequency (`none`,`monthly`,`quarterly`), created_at.
+**`portfolios`**
 
-**`portfolio_weights`**: portfolio_id FK, instrument_id FK, weight DOUBLE PRECISION, PK `(portfolio_id, instrument_id)`. CHECK weight between -1 and 1; service layer enforces sum = 1 for long-only.
+| column | type | notes |
+|---|---|---|
+| id | SERIAL PK | |
+| name | VARCHAR(100) UNIQUE NOT NULL | the CLI refers to portfolios by name or id |
+| description | TEXT | |
+| construction_method | ENUM `portfolio_method` | `manual`, `equal_weight`, `inverse_vol`, `min_variance`, `max_sharpe`: what was asked for |
+| effective_method | `portfolio_method` | what produced the weights (`inverse_vol` after an optimiser fallback) |
+| construction_params | JSONB NOT NULL DEFAULT '{}' | bounds, lookback, covariance method, shrinkage, ridge, risk-free rate, optimiser status, fallback reason, warnings |
+| estimation_start, estimation_end | DATE NULL | first and last price date of the window (null for manual) |
+| created_at | TIMESTAMPTZ DEFAULT now() | |
+
+**`portfolio_weights`**: portfolio_id FK (ON DELETE CASCADE), instrument_id FK (ON DELETE RESTRICT), weight DOUBLE PRECISION, PK `(portfolio_id, instrument_id)`, CHECK `weight BETWEEN 0 AND 1` (long-only). The service enforces sum = 1 within 1e-6. Saved portfolios are immutable: re-running construction with the stored window and parameters reproduces the weights exactly.
 
 ### 2.5 Backtests
 
@@ -189,8 +202,10 @@ FinComb/
 │   │   ├── risk.py             # vol, Sharpe, Sortino, MDD, VaR, CVaR, beta
 │   │   └── correlation.py
 │   ├── portfolio/
-│   │   ├── construction.py     # equal, inverse-vol, min-var, max-Sharpe
-│   │   └── analysis.py         # portfolio returns, risk contribution
+│   │   ├── covariance.py       # sample, Ledoit-Wolf, positive-definite guard
+│   │   ├── optimizer.py        # SLSQP wrapper with independent checks
+│   │   ├── construction.py     # equal, inverse-vol, min-var, max-Sharpe, fallback
+│   │   └── analysis.py         # portfolio returns, VaR/CVaR, beta, risk contribution
 │   ├── strategies/
 │   │   ├── base.py             # Strategy ABC: generate_weights(prices)
 │   │   ├── momentum.py         # cross-sectional / time-series momentum
@@ -204,7 +219,7 @@ FinComb/
 │   │   ├── market_data.py      # load_prices (aligned wide frame), price_bars
 │   │   ├── ingestion_service.py # choose source per symbol, run the pipeline
 │   │   ├── analytics_service.py # load prices → analytics, with alignment notes
-│   │   ├── portfolio_service.py
+│   │   ├── portfolio_service.py # estimation window, construct, save, risk report
 │   │   └── backtest_service.py
 │   ├── api/
 │   │   ├── main.py             # create_app(settings, session_factory) factory
@@ -288,11 +303,14 @@ Base path `/api/v1`. All responses JSON. Interactive docs at `/docs` (Swagger UI
 ### Portfolios
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/portfolios/construct` | Compute weights for `{symbols, method, lookback, constraints}`; not saved |
-| POST | `/portfolios` | Save a portfolio (manual or constructed weights) |
-| GET | `/portfolios` / `/portfolios/{id}` | List / detail |
-| DELETE | `/portfolios/{id}` | Remove |
-| GET | `/portfolios/{id}/risk` | Vol, VaR/CVaR (historical), beta vs benchmark, risk contribution per asset |
+| POST | `/portfolios/construct` | Weights for `{symbols, method, start?, end?, lookback, min_weight, max_weight, covariance, risk_free}`, with in-sample stats and risk contributions; not saved |
+| POST | `/portfolios` | Save `{name, description?, weights}` (manual) or `{name, description?, construction}` (computed on the server); 201, 409 if the name exists |
+| GET | `/portfolios` / `/portfolios/{id}` | List / detail with weights and construction parameters |
+| DELETE | `/portfolios/{id}` | Remove (204) |
+| GET | `/portfolios/{id}/risk` | `start, end, benchmark=SPY, confidence=0.95, risk_free`: performance, 1-day historical + Gaussian VaR/CVaR, beta/alpha/R², risk contribution per asset |
+| POST | `/portfolios/risk` | The same report for unsaved `{weights, ...}` |
+
+Every portfolio response has a `warnings` list, separate from the alignment `notes`: an optimiser fallback, a covariance ridge, a max-Sharpe portfolio with no positive excess return, or too few observations in the VaR tail. The CLI prints them as a highlighted `WARNING:` block above the numbers.
 
 ### Strategies & backtests
 | Method | Path | Purpose |
@@ -313,7 +331,8 @@ Backtests run **synchronously** in the MVP: daily data on tens of symbols over 1
 - **Returns:** simple returns from `adj_close`; log returns where additivity is needed.
 - **Annualisation:** 252 trading days. Vol = std(daily) × √252. Sharpe = mean(excess daily) / std(daily) × √252, risk-free rate as an annual input converted to daily.
 - **Max drawdown:** min of `equity / equity.cummax() − 1`.
-- **Portfolio construction:** equal weight; inverse volatility; minimum variance and maximum Sharpe via SLSQP with long-only, fully-invested, optional per-asset cap. Covariance from a trailing window, with optional Ledoit-Wolf-style shrinkage as a stretch.
+- **Portfolio construction:** equal weight; inverse volatility; minimum variance and maximum Sharpe via SLSQP with long-only, fully-invested, per-asset min/max bounds. Covariance from a trailing window with Ledoit-Wolf shrinkage by default; bounded inverse volatility is the visible fallback. Details in METHODOLOGY.md.
+- **Portfolio risk:** constant-mix returns; 1-day historical VaR (linear-interpolation quantile) and CVaR (the average of the same quantile function over the tail, so CVaR ≥ VaR), Gaussian VaR/CVaR alongside; closed-form OLS beta and Jensen's alpha; Euler risk contributions.
 - **Momentum:** rank by trailing 12-1 month return (skip last month), hold top-N equal weight, monthly rebalance. Time-series variant: long if trailing return > 0.
 - **Mean reversion:** z-score of price vs rolling mean; enter when z < −k, exit when z crosses 0. Optional ADF test (Statsmodels) reported as a diagnostic.
 - **Benchmark comparison:** excess return, tracking error, information ratio, OLS alpha/beta (Statsmodels).
@@ -344,7 +363,7 @@ Each milestone ends with: code, explanation, exact commands, tests passing, and 
 | **1** ✅ | **Foundation + data pipeline** | Repo scaffold, `pyproject.toml`, config, logging, Docker Compose Postgres, SQLAlchemy models, first Alembic migration, `MarketDataSource` + yfinance/Tiingo/CSV adapters (Stooq dropped), validation rules, idempotent upsert, ingestion audit, `fincomb ingest` CLI | `docker compose up db` + `fincomb ingest AAPL MSFT SPY --start 2015-01-01` fills Postgres; re-running inserts no duplicates; unit tests for validation, integration test for upsert |
 | **2** ✅ | **Analytics core** | `returns.py`, `risk.py`, `correlation.py` as pure functions | Metrics match hand-computed fixtures and known values; property tests (e.g. MDD ∈ [−1, 0]) |
 | **3** ✅ | **FastAPI backend** | App factory, error handling, routers for health/instruments/prices/ingestion/analytics, Pydantic schemas | OpenAPI docs live; integration tests via `TestClient` against test Postgres |
-| 4 | Portfolio construction & risk | Weight methods, risk metrics, portfolio endpoints | Weights sum to 1, respect bounds; min-var ≤ equal-weight variance on fixture data |
+| **4** ✅ | **Portfolio construction & risk** | Weight methods, risk metrics, portfolio endpoints | Weights sum to 1, respect bounds; min-var ≤ equal-weight variance on fixture data |
 | 5 | Strategies + backtest engine | Strategy ABC, momentum, mean reversion, buy-and-hold, engine with costs/slippage, benchmark report, persisted runs, backtest endpoints | Look-ahead perturbation test passes; buy-and-hold matches benchmark return exactly with zero costs |
 | 6 | Streamlit dashboard | Pages: Market data, Performance, Correlation heatmap, Portfolio builder, Backtest lab | Runs in Docker against the API; no direct DB access |
 | 7 | Polish for portfolio | Full Docker Compose, GitHub Actions CI (ruff, mypy, pytest + Postgres service), README with screenshots, METHODOLOGY.md, seed script, coverage badge | Fresh clone → `docker compose up` → working demo in one command |
@@ -363,7 +382,7 @@ Stretch (only if time allows): async job queue for long backtests, walk-forward 
 | **Adjusted vs raw prices** | Splits/dividends distort returns | Store both; analytics use `adj_close`; validation flags >40% one-day moves for review |
 | **Misaligned calendars** (ETFs vs stocks, holidays, missing bars) | Wrong correlations, NaN propagation | Align on inner-joined trading dates; explicit, documented missing-data policy (no forward-fill beyond N days) |
 | **Metric convention ambiguity** (252 vs 365, arithmetic vs geometric) | Numbers differ from other tools, credibility hit | One constants module; conventions written down; tests against known reference values |
-| **Optimiser instability** (singular covariance, non-convergence) | Bad or crashing weights | Minimum history check, small ridge term on covariance, fall back to inverse-vol with a logged warning |
+| **Optimiser instability** (singular covariance, non-convergence) | Bad or crashing weights | Minimum history check (max(60, 2N) returns), Ledoit-Wolf shrinkage, smallest ridge that makes the covariance positive definite, independent check of every solution, fall back to bounded inverse-vol with a visible warning |
 | **Overfitting / data snooping** | Strategy results not meaningful | Report in-sample vs out-of-sample split (stretch: walk-forward); keep strategies simple |
 | **Flaky integration tests** | CI noise | Tests use fixture CSVs; Postgres via Compose service in CI; each test in a rolled-back transaction |
 | **Docker friction on your machine** (Windows/Apple Silicon) | Setup time | Multi-arch slim images; app also runs locally against Dockerised Postgres only |

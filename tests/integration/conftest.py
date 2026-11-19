@@ -51,7 +51,8 @@ def session_factory(engine):
     with engine.begin() as conn:
         conn.execute(
             text(
-                "TRUNCATE data_quality_issues, price_bars, ingestion_runs, "
+                "TRUNCATE portfolio_weights, portfolios, data_quality_issues, price_bars, "
+                "ingestion_runs, "
                 "instruments RESTART IDENTITY CASCADE"
             )
         )

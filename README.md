@@ -1,14 +1,15 @@
 # FinComb
 
 An end-to-end financial intelligence and quantitative research platform: it ingests
-and validates market data, stores it in PostgreSQL, analyses performance and risk, serves it all through a REST
-API, and (in later milestones) optimises portfolios and backtests trading strategies
-without look-ahead bias.
+and validates market data, stores it in PostgreSQL, analyses performance and risk, builds and risk-checks
+portfolios, serves it all through a REST API, and (in later milestones) backtests
+trading strategies without look-ahead bias.
 
 Tech stack: Python · PostgreSQL · SQLAlchemy · Alembic · FastAPI · pandas / NumPy ·
 SciPy / Statsmodels · Plotly · Streamlit · Pytest · Docker
 
-> Status: **Milestone 3 of 7 done** (data pipeline, analytics core and REST API). See
+> Status: **Milestone 4 of 7 done** (data pipeline, analytics core, REST API, and
+> portfolio construction and risk). See
 > the [roadmap](#roadmap).
 
 ## What works today
@@ -36,6 +37,12 @@ SciPy / Statsmodels · Plotly · Streamlit · Pytest · Docker
   analytics as JSON, with interactive OpenAPI docs at `/docs`, one error format and
   no business logic in the routes (they call the same services as the CLI). See
   [docs/MILESTONE_3.md](docs/MILESTONE_3.md).
+- **Portfolio construction and risk:** equal weight, inverse volatility, minimum
+  variance and maximum Sharpe (SciPy SLSQP, Ledoit-Wolf covariance, per-asset
+  bounds, a visible fallback), saved portfolios that can be reproduced exactly,
+  and risk reports with historical and Gaussian VaR/CVaR, beta/alpha and risk
+  contributions, from both `fincomb portfolio ...` and `/api/v1/portfolios`. See
+  [docs/MILESTONE_4.md](docs/MILESTONE_4.md).
 
 ## Quick start
 
@@ -57,6 +64,7 @@ fincomb coverage
 fincomb analyze AAPL MSFT SPY --risk-free 0.04
 fincomb correlation AAPL MSFT SPY
 fincomb drawdowns SPY
+fincomb portfolio compare AAPL MSFT SPY --max-weight 0.6
 pytest
 fincomb serve                     # API on http://127.0.0.1:8000, docs at /docs
 ```
@@ -86,8 +94,9 @@ src/fincomb/
   db/                  SQLAlchemy models, engine, repositories (all SQL lives here)
   ingestion/           MarketDataSource + yfinance, tiingo, csv adapters, pipeline
   validation/          data-quality rules
-  analytics/           returns, risk, correlation (pure functions, no I/O)
-  services/            shared by CLI and API: load prices, run analytics, run ingestion
+  analytics/           returns, risk, VaR/CVaR, beta, correlation (pure functions, no I/O)
+  portfolio/           covariance, optimiser, weighting methods, portfolio risk (pure)
+  services/            shared by CLI and API: load prices, analytics, portfolios, ingestion
   api/                 FastAPI app factory, routers, Pydantic schemas, error mapping
   cli.py               `fincomb` command (thin: parses arguments, calls services)
 migrations/            Alembic schema migrations
@@ -102,7 +111,7 @@ docs/                  architecture and milestone guides
 1. ✅ Foundation and data pipeline
 2. ✅ Analytics core: returns, volatility, Sharpe, drawdown, correlation
 3. ✅ FastAPI backend: REST API over the data and analytics
-4. Portfolio construction and risk
+4. ✅ Portfolio construction and risk
 5. Strategies (momentum, mean reversion) and a backtest engine with costs and slippage
 6. Streamlit dashboard
 7. CI, documentation and polish

@@ -152,3 +152,137 @@ def rolling_sharpe(
     roll = excess.rolling(window, min_periods=window)
     std = roll.std(ddof=1)
     return roll.mean() / std.where(std.abs() > _ZERO) * np.sqrt(periods_per_year)
+
+
+# --- Tail risk: Value at Risk and Conditional VaR ------------------------------------------
+#
+# Both are reported as POSITIVE numbers meaning a loss over one period (one day for
+# daily returns): "95% VaR = 0.018" means a loss larger than 1.8% happens on only
+# 5% of days. The quantile is NumPy's default linear interpolation (Excel's
+# PERCENTILE.INC); CVaR averages that SAME quantile function over the tail, so the
+# two are consistent for any sample size and CVaR >= VaR always holds.
+
+
+def _check_confidence(confidence: float) -> float:
+    if not 0.0 < confidence < 1.0:
+        raise ValueError("confidence must be between 0 and 1, e.g. 0.95")
+    return float(confidence)
+
+
+def _clean_series(returns: pd.Series, min_rows: int = 2) -> np.ndarray:
+    if not isinstance(returns, pd.Series):
+        raise TypeError("tail-risk functions take one return series (a Series)")
+    check_returns(returns, min_rows)
+    return returns.dropna().to_numpy(dtype="float64")
+
+
+def _quantile_integral(sorted_x: np.ndarray, p: float) -> float:
+    """Exact integral of the linear-interpolation quantile function Q(u) over [0, p].
+
+    Q is piecewise linear with knots Q(k / (n - 1)) = x_(k), so the integral is a sum
+    of trapezoids: whole ones up to the last knot below p, plus a partial one.
+    """
+    n = len(sorted_x)
+    step = 1.0 / (n - 1)
+    h = (n - 1) * p  # position of p in knot units
+    m = int(np.floor(h))
+    full = step * float(np.sum(sorted_x[:m] + sorted_x[1 : m + 1]) / 2.0) if m > 0 else 0.0
+    frac = h - m
+    if frac > 0:
+        q_p = sorted_x[m] + frac * (sorted_x[m + 1] - sorted_x[m])
+        full += frac * step * (sorted_x[m] + q_p) / 2.0
+    return full
+
+
+def historical_var(returns: pd.Series, confidence: float = 0.95) -> float:
+    """Historical VaR: minus the (1 - confidence) quantile of the returns (a positive loss)."""
+    confidence = _check_confidence(confidence)
+    x = _clean_series(returns)
+    return float(-np.quantile(x, 1.0 - confidence))
+
+
+def historical_cvar(returns: pd.Series, confidence: float = 0.95) -> float:
+    """Historical CVaR (expected shortfall): the average loss in the worst (1 - confidence) tail.
+
+    Defined as -(1/p) * integral_0^p Q(u) du with p = 1 - confidence and Q the same
+    linear-interpolation quantile function as `historical_var`. A fractional number of
+    tail observations needs no rounding, and because Q never decreases, the average
+    of Q below p is at most Q(p): CVaR >= VaR by construction.
+    """
+    confidence = _check_confidence(confidence)
+    x = np.sort(_clean_series(returns))
+    p = 1.0 - confidence
+    return float(-_quantile_integral(x, p) / p)
+
+
+def tail_observations(returns: pd.Series, confidence: float = 0.95) -> float:
+    """How many observations the (1 - confidence) tail holds: n x (1 - confidence)."""
+    confidence = _check_confidence(confidence)
+    return float(returns.notna().sum()) * (1.0 - confidence)
+
+
+def parametric_var(returns: pd.Series, confidence: float = 0.95) -> float:
+    """Gaussian VaR: -(mean + z * std), z the (1 - confidence) standard normal quantile."""
+    from scipy.stats import norm
+
+    confidence = _check_confidence(confidence)
+    x = _clean_series(returns)
+    z = norm.ppf(1.0 - confidence)
+    return float(-(x.mean() + z * x.std(ddof=1)))
+
+
+def parametric_cvar(returns: pd.Series, confidence: float = 0.95) -> float:
+    """Gaussian CVaR: std * pdf(z) / (1 - confidence) - mean."""
+    from scipy.stats import norm
+
+    confidence = _check_confidence(confidence)
+    x = _clean_series(returns)
+    z = norm.ppf(1.0 - confidence)
+    return float(x.std(ddof=1) * norm.pdf(z) / (1.0 - confidence) - x.mean())
+
+
+# --- Beta and alpha against a benchmark -----------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BetaResult:
+    beta: float  # Cov(r_p, r_b) / Var(r_b): the OLS slope
+    alpha: float  # Jensen's alpha, annualised (x periods_per_year)
+    correlation: float
+    r_squared: float
+    observations: int
+
+
+def beta_alpha(
+    returns: pd.Series,
+    benchmark: pd.Series,
+    risk_free: float = 0.0,
+    periods_per_year: int = TRADING_DAYS,
+) -> BetaResult:
+    """Beta, Jensen's alpha, correlation and R^2 of `returns` against `benchmark`.
+
+    Closed-form OLS on the dates both series have. With a constant risk-free rate the
+    slope is the same for raw and excess returns; only alpha uses the excess returns:
+    alpha = mean(r - rf) - beta * mean(r_b - rf), annualised. A benchmark with zero
+    variance gives NaN beta, alpha and correlation.
+    """
+    if not isinstance(returns, pd.Series) or not isinstance(benchmark, pd.Series):
+        raise TypeError("beta_alpha takes two return series")
+    both = pd.concat([returns, benchmark], axis=1, join="inner").dropna()
+    check_returns(both.iloc[:, 0], 3)
+    rp = both.iloc[:, 0].to_numpy(dtype="float64")
+    rb = both.iloc[:, 1].to_numpy(dtype="float64")
+    var_b = rb.var(ddof=1)
+    var_p = rp.var(ddof=1)
+    cov = float(np.cov(rp, rb, ddof=1)[0, 1])
+    beta = _safe_div(cov, var_b)
+    rf = periodic_rate(risk_free, periods_per_year)
+    alpha = (rp.mean() - rf - beta * (rb.mean() - rf)) * periods_per_year
+    corr = _safe_div(cov, np.sqrt(var_p * var_b))
+    return BetaResult(
+        beta=float(beta),
+        alpha=float(alpha),
+        correlation=float(corr),
+        r_squared=float(corr**2),
+        observations=len(both),
+    )
