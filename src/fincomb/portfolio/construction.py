@@ -281,7 +281,11 @@ def construct(
                     f"a ridge of {ridge:g} x the average variance was added so it could be "
                     "optimised."
                 )
+            # Divide by the average variance so the solver sees numbers of order 1 whatever
+            # the asset volatilities: SLSQP's tolerance is absolute. The optimal weights
+            # don't change (variance scales, the Sharpe ratio only gains a constant factor).
             cov = repaired.cov.to_numpy()
+            cov = cov / (np.trace(cov) / n)
             ew = np.full(n, 1.0 / n)
             iv = bounded_proportional(1.0 / np.sqrt(np.diag(cov)), bounds)
             if method == "min_variance":
@@ -295,9 +299,11 @@ def construct(
                 objective, gradient = _sharpe_problem(excess, cov)
                 heavy = _heavy_starts(n, bounds)
                 candidates = [ew, iv, *heavy]
-                # With no positive excess return the problem is no longer quasi-concave,
-                # so search from several corners instead of trusting one start.
-                starts = [ew, iv, *heavy] if non_positive else [ew]
+                # The Sharpe ratio is not convex, and with no positive excess return it is
+                # not even quasi-concave, and SLSQP's line search can stall from a single
+                # start. Several starts (equal weight, inverse vol, one corner per asset)
+                # cost little for tens of assets and make the answer robust.
+                starts = [ew, iv, *heavy]
             solved = solve(objective, gradient, starts, bounds.min_weight, bounds.max_weight)
             info = OptimizerInfo(solved.success, solved.message, solved.iterations)
             if solved.weights is None:

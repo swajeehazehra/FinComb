@@ -168,16 +168,21 @@ the result has `non_positive_excess_return: true` and a warning, shown above the
 weights in the CLI and in `warnings` in the API, and kept with a saved portfolio.
 **Such a portfolio is not an attractive investment and should not be read as a
 recommendation**; use minimum variance, another window or a lower risk-free rate.
-Because the problem is no longer well-behaved, SLSQP is started from equal
-weights, inverse volatility and one corner per asset, and the best answer kept.
+As always for maximum Sharpe, SLSQP is started from several points and the best
+valid answer is kept (see below).
 
 ## The optimiser
 
 Minimum variance and maximum Sharpe use SciPy's SLSQP with analytic gradients
 (2Σw, and the quotient rule for the Sharpe ratio), the equality constraint
-sum(w) = 1, box bounds, `ftol = 1e-12`, at most 500 iterations, starting from
-equal weights. Σ is annualised first so the objective isn't of order 1e-4, where
-an absolute tolerance would stop too early.
+sum(w) = 1, box bounds, `ftol = 1e-12`, at most 500 iterations. Minimum variance
+(convex) starts from equal weights. Maximum Sharpe is not convex and SLSQP's line
+search can stall from a single start, so it is started from equal weights,
+inverse volatility and one corner per asset (the asset as large as the bounds
+allow), and the best valid answer is kept. Σ is divided by its average variance before solving, so the
+objective is of order 1 whatever the volatilities (SLSQP's tolerance is absolute;
+with raw daily variances around 1e-4 it would stop too early). That rescaling
+leaves the optimal weights unchanged.
 
 **Covariance regularisation.** The default estimator is **Ledoit-Wolf
 shrinkage** toward a scaled identity, $\hat\Sigma = \delta F + (1-\delta) S$ with

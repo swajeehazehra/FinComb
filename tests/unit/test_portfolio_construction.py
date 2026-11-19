@@ -474,15 +474,24 @@ def test_max_sharpe_beats_the_other_methods(seed, n):
         assert best >= _sharpe(other, prices) - 1e-6
 
 
+def _objective(method, w, prices):
+    return port_var(w, prices) if method == "min_variance" else -_sharpe(w, prices)
+
+
 @settings(max_examples=30, deadline=None)
 @given(seeds)
 def test_reordering_assets_reorders_weights(seed):
     prices = random_prices(seed, n_assets=5, n_days=150, mean=None)
     shuffled = prices[list(reversed(prices.columns))]
     for method in ("min_variance", "max_sharpe"):
-        a = construct(prices, method).weights
-        b = construct(shuffled, method).weights
-        pd.testing.assert_series_equal(a.sort_index(), b.sort_index(), atol=1e-6)
+        a = construct(prices, method, covariance="sample").weights
+        b = construct(shuffled, method, covariance="sample").weights.reindex(a.index)
+        # The optimum value is identical; near a flat optimum the weights themselves may
+        # differ at the solver's tolerance.
+        assert _objective(method, b.to_numpy(), prices) == pytest.approx(
+            _objective(method, a.to_numpy(), prices), rel=1e-6, abs=1e-12
+        )
+        np.testing.assert_allclose(a, b, atol=1e-3)
 
 
 @settings(max_examples=30, deadline=None)
@@ -493,7 +502,12 @@ def test_scaling_returns_leaves_weights_unchanged(seed, c):
     for method in ("min_variance", "max_sharpe"):
         a = construct(prices, method, covariance="sample").weights
         b = construct(scaled, method, covariance="sample").weights
-        pd.testing.assert_series_equal(a, b, atol=1e-5)
+        # Scaling returns by c multiplies the variance by c^2 and leaves Sharpe alone, so the
+        # same weights are optimal: compare the objective on the original data.
+        assert _objective(method, b.to_numpy(), prices) == pytest.approx(
+            _objective(method, a.to_numpy(), prices), rel=1e-6, abs=1e-12
+        )
+        np.testing.assert_allclose(a, b, atol=1e-3)
 
 
 @settings(max_examples=30, deadline=None)
@@ -501,7 +515,10 @@ def test_scaling_returns_leaves_weights_unchanged(seed, c):
 def test_tighter_cap_never_lowers_minimum_variance(seed):
     prices = random_prices(seed, n_assets=5, n_days=150, mean=None)
     variances = [
-        port_var(construct(prices, "min_variance", WeightBounds(0, cap)).weights, prices)
+        port_var(
+            construct(prices, "min_variance", WeightBounds(0, cap), covariance="sample").weights,
+            prices,
+        )
         for cap in (1.0, 0.5, 0.3, 0.2)
     ]
     assert all(b >= a * (1 - 1e-7) for a, b in zip(variances, variances[1:], strict=False))

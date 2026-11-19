@@ -170,7 +170,9 @@ curl.exe -s -X POST "$api/portfolios" -H "Content-Type: application/json" -d $ba
 
 - `/health` shows `"schema_revision": "0003_portfolios"`.
 - In `compare`, minimum variance has the lowest volatility of the four columns
-  and maximum Sharpe the highest Sharpe (both in-sample).
+  and maximum Sharpe the highest Sharpe (both in-sample). With `--covariance
+  sample` this holds exactly; with the default Ledoit-Wolf the optimisers work
+  on the shrunk matrix, so a near-tie can very occasionally go the other way.
 - Weights sum to 100% and respect `--max-weight` / `--min-weight`.
 - `portfolio risk` and `GET /portfolios/{id}/risk` give identical numbers.
 - CVaR is never below VaR; at 99% on one year of data you get a warning that
