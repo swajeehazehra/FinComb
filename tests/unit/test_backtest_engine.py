@@ -218,6 +218,64 @@ def test_hand_worked_same_close():
     assert res.targets.index[1] == IDX[2]
 
 
+# --- the final date: no trade executes there -------------------------------------------------
+
+# Data ends the trading day after a month end: 2023-03-31 (Fri) is the last monthly signal
+# date and the penultimate row, 2023-04-03 (Mon) is the final row.
+_END_IDX = pd.bdate_range("2023-01-02", "2023-04-03")
+
+
+def _ends_after_signal():
+    rng = np.random.default_rng(7)
+    r = rng.normal(0, 0.02, (len(_END_IDX), 2))
+    return pd.DataFrame(100 * np.cumprod(1 + r, axis=0), index=_END_IDX, columns=["A", "B"])
+
+
+@pytest.mark.parametrize("execution", MODES)
+@pytest.mark.parametrize("rebalance", ["monthly", "daily"])
+def test_no_trade_executes_on_the_final_date(execution, rebalance):
+    prices = _ends_after_signal()
+    penultimate, final = _END_IDX[-2], _END_IDX[-1]
+    assert rebalance_mask(_END_IDX, rebalance)[-2]  # a scheduled signal on the penultimate row
+    res = run(
+        prices,
+        FixedWeights(["A", "B"]),
+        None,
+        rebalance=rebalance,
+        costs=FixedBpsCost(10),
+        execution=execution,
+    )
+    # Nothing is traded or charged on the final date in either mode.
+    assert res.turnover.loc[final] == 0 and res.costs.loc[final] == 0
+    assert all(t.date < final for t in res.trades)
+    assert final not in res.targets.index
+    # The final day is pure drift from the previous close's holdings.
+    drift = res.weights.loc[penultimate].to_numpy() @ (prices.iloc[-1] / prices.iloc[-2]).to_numpy()
+    assert res.equity.loc[final] == pytest.approx(res.equity.loc[penultimate] * drift, rel=1e-12)
+    if execution == "next_close":
+        # The penultimate-row signal is not taken: its fill would land on the final date.
+        assert penultimate not in res.signal_dates
+    else:
+        # same_close trades at the penultimate close and holds over the final day's return.
+        assert res.targets.index[-1] == penultimate and res.signal_dates[-1] == penultimate
+        assert res.turnover.loc[penultimate] > 0
+
+
+def test_next_close_still_fills_on_the_penultimate_date():
+    """Only the fill on the final date is dropped: one more row and the Mar 31 signal fills."""
+    idx = pd.bdate_range("2023-01-02", "2023-04-04")
+    rng = np.random.default_rng(7)
+    prices = pd.DataFrame(
+        100 * np.cumprod(1 + rng.normal(0, 0.02, (len(idx), 2)), axis=0),
+        index=idx,
+        columns=["A", "B"],
+    )
+    res = run(prices, FixedWeights(["A", "B"]), None, costs=FixedBpsCost(10))
+    assert res.signal_dates[-1] == pd.Timestamp("2023-03-31")
+    assert res.targets.index[-1] == pd.Timestamp("2023-04-03")  # the penultimate row
+    assert res.turnover.loc["2023-04-03"] > 0 and res.turnover.iloc[-1] == 0
+
+
 # --- costs and turnover ---------------------------------------------------------------------
 
 

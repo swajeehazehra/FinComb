@@ -265,7 +265,20 @@ including close $t$, never later. Its targets are executed at close $t+1$
 (`next_close`, the default) or at close $t$ (`same_close`, which assumes you can trade
 at the close you just used for the signal, so it is optimistic). Rebalance dates are
 the last trading day of each week, month, quarter or year in the data's own
-calendar; the final date of the data is never one (its period may be incomplete).
+calendar.
+
+**The final date.** No trade ever executes on the last date of the data, in either
+mode: a trade there would pay costs with no later price move to earn a return. Two
+rules ensure this. The final date is never a rebalance date (its period may also be
+incomplete). Under `next_close` the engine also does not take a signal on the
+penultimate date, because its fill would land on the final date. So if the data ends
+the trading day after a month end, a monthly `next_close` backtest makes its last trade
+at the previous month's fill, while `same_close` still trades at the month-end close
+and holds that position over the final day. The final day's return is always earned by
+the holdings of the close before it. (The strategy is not called on that skipped
+penultimate date, so a stateful strategy such as `mean_reversion` simply never sees
+it.)
+
 `mean_reversion` is evaluated daily but only trades when a position opens or closes.
 
 **Initialisation.** The first position is bought by a special trade at the close of

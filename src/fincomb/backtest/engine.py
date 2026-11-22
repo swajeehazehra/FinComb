@@ -9,6 +9,12 @@ Weight-based and long-only. Each day:
    including this close only, and its targets are executed now (`same_close`) or
    at the next close (`next_close`, the default).
 
+**The final date.** No trade ever executes on the last date of the data: a trade
+there would pay costs with no later price move to earn anything. The schedule never
+marks the final date, and under `next_close` the engine also skips the signal on the
+penultimate date, whose fill would land on the final date. Under `same_close` a
+penultimate-date trade still executes, since it is held over the final day's return.
+
 **Initialisation.** The first position is a special trade at the close of the first
 evaluation date (day 0) in both modes, charged normal costs. Strategies whose
 targets don't depend on prices are called at day 0. Price-dependent strategies use
@@ -241,6 +247,10 @@ def run(
         cash = after * (1.0 - float(w.sum()))
 
     pending: tuple[np.ndarray, pd.Timestamp] | None = None
+    last = len(index) - 1
+    # Under next_close a signal at `last - 1` would fill on the final date, where the
+    # trade costs money but can't earn a return before the data ends: don't take it.
+    last_signal = last - 1 if execution == "next_close" else last
     for k in range(day0, len(index)):
         i = k - day0
         if k == day0:
@@ -254,7 +264,7 @@ def run(
                 execute(k, pending[0], "rebalance", pending[1])
                 pending = None
         # A day-0 signal under same_close is the initialisation trade itself.
-        if mask[k] and not (k == day0 and execution == "same_close"):
+        if mask[k] and k < last_signal and not (k == day0 and execution == "same_close"):
             w, when = signal(k)
             if w is not None:
                 if execution == "same_close":
