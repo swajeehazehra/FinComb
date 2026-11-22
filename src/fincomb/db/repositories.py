@@ -12,6 +12,9 @@ from sqlalchemy.orm import Session, selectinload
 
 from fincomb.db.models import (
     AssetType,
+    BacktestEquity,
+    BacktestRun,
+    BacktestTrade,
     DataQualityIssue,
     IngestionRun,
     Instrument,
@@ -305,3 +308,73 @@ class PortfolioRepository:
         """{symbol: weight}, in symbol order."""
         pairs = sorted((w.instrument.symbol, w.weight) for w in portfolio.weights)
         return dict(pairs)
+
+
+class BacktestRepository:
+    """Stored backtest runs with their equity curves and trades."""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def create(self, run: BacktestRun, equity: list[dict], trades: list[dict]) -> BacktestRun:
+        """Insert a run, its equity rows and its trades (`symbol` per trade row)."""
+        self.session.add(run)
+        self.session.flush()
+        if equity:
+            self.session.execute(
+                pg_insert(BacktestEquity), [{**row, "run_id": run.id} for row in equity]
+            )
+        if trades:
+            ids = {
+                i.symbol: i.id
+                for i in self.session.scalars(
+                    select(Instrument).where(Instrument.symbol.in_({t["symbol"] for t in trades}))
+                )
+            }
+            rows = []
+            for t in trades:
+                row = {k: v for k, v in t.items() if k != "symbol"}
+                rows.append({**row, "run_id": run.id, "instrument_id": ids[t["symbol"]]})
+            for i in range(0, len(rows), UPSERT_CHUNK_ROWS):
+                self.session.execute(pg_insert(BacktestTrade), rows[i : i + UPSERT_CHUNK_ROWS])
+        self.session.flush()
+        return run
+
+    def get(self, run_id: int) -> BacktestRun | None:
+        return self.session.get(BacktestRun, run_id)
+
+    def list_runs(self, strategy: str | None = None, limit: int = 50) -> list[BacktestRun]:
+        stmt = select(BacktestRun).order_by(BacktestRun.id.desc()).limit(limit)
+        if strategy:
+            stmt = stmt.where(BacktestRun.strategy == strategy)
+        return list(self.session.scalars(stmt))
+
+    def equity(self, run_id: int) -> list[BacktestEquity]:
+        stmt = (
+            select(BacktestEquity)
+            .where(BacktestEquity.run_id == run_id)
+            .order_by(BacktestEquity.bar_date)
+        )
+        return list(self.session.scalars(stmt))
+
+    def trades(
+        self, run_id: int, limit: int | None = None, offset: int = 0
+    ) -> list[tuple[BacktestTrade, str]]:
+        stmt = (
+            select(BacktestTrade, Instrument.symbol)
+            .join(Instrument, Instrument.id == BacktestTrade.instrument_id)
+            .where(BacktestTrade.run_id == run_id)
+            .order_by(BacktestTrade.bar_date, BacktestTrade.id)
+            .offset(offset)
+        )
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        return [(t, s) for t, s in self.session.execute(stmt)]
+
+    def trade_count(self, run_id: int) -> int:
+        stmt = select(func.count()).select_from(BacktestTrade).where(BacktestTrade.run_id == run_id)
+        return int(self.session.scalar(stmt) or 0)
+
+    def delete(self, run: BacktestRun) -> None:
+        self.session.delete(run)
+        self.session.flush()

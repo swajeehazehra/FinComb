@@ -1,10 +1,12 @@
 # FinComb: Financial Intelligence & Quantitative Research Platform
 
-**Design document, v0.3. Milestones 1 to 4 implemented** (data pipeline, analytics core, REST API, portfolio construction and risk).
+**Design document, v0.4. Milestones 1 to 5 implemented** (data pipeline, analytics core, REST API, portfolio construction and risk, strategies and backtesting).
 
 Changes since v0.1: Stooq was replaced by Tiingo as the fallback source (Stooq now requires an API key and a browser check); each symbol has one owning data source ([DATA_INTEGRITY.md](DATA_INTEGRITY.md)); the API section below describes what Milestone 3 actually built.
 
 Changes in v0.3 (Milestone 4): the portfolio tables in §2.4 are long-only and record the requested and effective method, the construction parameters and the estimation window; `rebalance_frequency` moved to Milestone 5; `portfolio/` gained `covariance.py` and `optimizer.py`; `POST /portfolios/risk` was added for unsaved weights; beta uses the closed-form OLS slope (Statsmodels arrives with Milestone 5).
+
+Changes in v0.4 (Milestone 5): strategies are called with history sliced to the signal date (not a vectorised frame the engine shifts), and execution defaults to the next close, with the initial allocation bought by a special trade at the first evaluation close (§5.1); two strategies were added (`fixed_weights`, which carries `rebalance_frequency` and backtests saved portfolios, and `optimized`, which re-runs `construct()` at each rebalance); `backtest_runs` stores only successful runs and gained requested/effective dates, warm-up start, rebalance frequency, execution, risk-free rate, portfolio id, warnings, notes and duration (no `status`); a `verify` command and route rerun a stored backtest; Statsmodels gives Newey-West alpha/beta and the ADF test.
 
 Python package name: `fincomb`.
 
@@ -59,7 +61,7 @@ Python package name: `fincomb`.
 | API | FastAPI + Pydantic v2 | Auto OpenAPI docs at `/docs`, request validation |
 | Data source | yfinance (default), Tiingo REST API (fallback, free key) | Free; adapter pattern isolates breakage. Each symbol is owned by one source so histories are never mixed |
 | Optimisation | SciPy `minimize` (SLSQP) | Constrained min-variance / max-Sharpe without extra deps |
-| Statistics | NumPy closed form (Milestone 4), Statsmodels (Milestone 5) | OLS beta/alpha vs benchmark; t-statistics and the ADF test for mean reversion |
+| Statistics | NumPy closed form (Milestone 4), Statsmodels (Milestone 5) | OLS beta/alpha vs benchmark with Newey-West t-statistics; the ADF test for mean reversion |
 | Charts | Plotly | Same figures work in Streamlit and notebooks |
 | Logging | stdlib `logging` with JSON formatter option | No extra deps; structured logs in Docker |
 | Tests | Pytest, pytest-cov, Hypothesis (property tests) | Unit tests on pure core, integration tests on a real Postgres |
@@ -132,29 +134,36 @@ PostgreSQL 16. Prices are stored as `DOUBLE PRECISION` (analytics run in float64
 
 **`portfolio_weights`**: portfolio_id FK (ON DELETE CASCADE), instrument_id FK (ON DELETE RESTRICT), weight DOUBLE PRECISION, PK `(portfolio_id, instrument_id)`, CHECK `weight BETWEEN 0 AND 1` (long-only). The service enforces sum = 1 within 1e-6. Saved portfolios are immutable: re-running construction with the stored window and parameters reproduces the weights exactly.
 
-### 2.5 Backtests
+### 2.5 Backtests (migration 0004)
 
-**`backtest_runs`**
+**`backtest_runs`** (only successful runs are stored; a failing run returns an error and writes nothing)
 
 | column | type | notes |
 |---|---|---|
 | id | SERIAL PK | |
-| strategy | VARCHAR(50) | `momentum`, `mean_reversion`, `buy_and_hold` |
-| params | JSONB | lookback, thresholds, etc. |
+| strategy | VARCHAR(50) | `buy_and_hold`, `fixed_weights`, `optimized`, `momentum`, `mean_reversion` |
+| params | JSONB | validated strategy parameters with defaults filled in (incl. a saved portfolio's weights) |
 | symbols | TEXT[] | universe |
-| benchmark_symbol | VARCHAR(20) | e.g. `SPY` |
-| start_date, end_date | DATE | |
-| initial_capital | DOUBLE PRECISION | |
-| cost_bps, slippage_bps | DOUBLE PRECISION | |
-| code_version | VARCHAR(40) | git SHA |
-| data_hash | CHAR(64) | SHA-256 of the input price frame |
-| metrics | JSONB | CAGR, vol, Sharpe, Sortino, MDD, turnover, alpha/beta… |
-| status | ENUM(`success`,`failed`) | |
+| benchmark_symbol | VARCHAR(20) NULL | e.g. `SPY`; null = none |
+| start_date, end_date | DATE | effective evaluation period (day 0 to the last date) |
+| requested_start, requested_end | DATE NULL | what was asked for |
+| warmup_start | DATE NULL | first price date the strategy could read |
+| rebalance_frequency | VARCHAR(10) | `daily` … `never` |
+| execution | VARCHAR(12) | `next_close` or `same_close` |
+| initial_capital | DOUBLE PRECISION | CHECK > 0 |
+| cost_bps, slippage_bps | DOUBLE PRECISION | CHECK >= 0 |
+| risk_free | DOUBLE PRECISION | annual rate used by the report |
+| portfolio_id | INT FK → portfolios ON DELETE SET NULL | source of `fixed_weights` / `buy_and_hold` weights |
+| code_version | VARCHAR(40) | git SHA (or `FINCOMB_CODE_VERSION`) |
+| data_hash | VARCHAR(64) | SHA-256 of the exact input prices |
+| metrics | JSONB | strategy, benchmark, relative (TE, IR, HAC alpha/beta), trading, diagnostics |
+| warnings, notes | JSONB | as for portfolios |
+| duration_ms | INT | |
 | created_at | TIMESTAMPTZ | |
 
-**`backtest_equity`**: run_id FK, bar_date, equity, cash, gross_exposure, benchmark_equity, drawdown. PK `(run_id, bar_date)`.
+**`backtest_equity`**: run_id FK (CASCADE), bar_date, equity, cash, gross_exposure, benchmark_equity, drawdown, turnover, costs. PK `(run_id, bar_date)`.
 
-**`backtest_trades`**: id, run_id FK, bar_date, instrument_id FK, quantity, fill_price, notional, commission, slippage_cost.
+**`backtest_trades`**: id, run_id FK (CASCADE), bar_date, instrument_id FK (RESTRICT), kind (`init`/`rebalance`), side, weight_before, weight_after, quantity (indicative, fractional), reference_price (raw close), fill_price, notional, commission, slippage_cost. Index `(run_id, bar_date)`.
 
 Computed analytics (returns, correlations) are **not** stored; they are cheap to recompute from `price_bars` and storing them risks staleness. Only backtests are persisted because they are the "experiments" a researcher wants to compare later.
 
@@ -207,14 +216,20 @@ FinComb/
 │   │   ├── construction.py     # equal, inverse-vol, min-var, max-Sharpe, fallback
 │   │   └── analysis.py         # portfolio returns, VaR/CVaR, beta, risk contribution
 │   ├── strategies/
-│   │   ├── base.py             # Strategy ABC: generate_weights(prices)
+│   │   ├── base.py             # Strategy ABC: target_weights(history to t, previous)
+│   │   ├── params.py           # ParamSpec: parsing, validation, JSON Schema
+│   │   ├── buy_and_hold.py
+│   │   ├── fixed_weights.py    # constant weights reset at a rebalance frequency
+│   │   ├── optimized.py        # portfolio construction on a trailing window
 │   │   ├── momentum.py         # cross-sectional / time-series momentum
-│   │   ├── mean_reversion.py   # z-score / Bollinger reversion
-│   │   └── buy_and_hold.py
+│   │   ├── mean_reversion.py   # z-score reversion + ADF diagnostic
+│   │   └── registry.py
 │   ├── backtest/
-│   │   ├── engine.py           # vectorised daily engine
-│   │   ├── costs.py            # commission + slippage models
-│   │   └── report.py           # metrics + benchmark comparison
+│   │   ├── schedule.py         # rebalance dates
+│   │   ├── engine.py           # daily engine: timing, drift, costs, trade log
+│   │   ├── costs.py            # commission + slippage in bps
+│   │   ├── report.py           # metrics + benchmark comparison (HAC regression)
+│   │   └── reproducibility.py  # data hash, code version
 │   ├── services/               # orchestration used by API and CLI
 │   │   ├── market_data.py      # load_prices (aligned wide frame), price_bars
 │   │   ├── ingestion_service.py # choose source per symbol, run the pipeline
@@ -315,12 +330,14 @@ Every portfolio response has a `warnings` list, separate from the alignment `not
 ### Strategies & backtests
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/strategies` | Available strategies + JSON schema of their parameters |
-| POST | `/backtests` | Run `{strategy, params, symbols, benchmark, start, end, initial_capital, cost_bps, slippage_bps}`; persisted, returns id + metrics |
-| GET | `/backtests` | List past runs (compare experiments) |
-| GET | `/backtests/{id}` | Run detail + metrics + benchmark comparison |
-| GET | `/backtests/{id}/equity` | Equity, benchmark and drawdown curves |
-| GET | `/backtests/{id}/trades` | Trade log |
+| GET | `/strategies` | Available strategies, default rebalance, JSON Schema of their parameters |
+| POST | `/backtests` | Run `{strategy, symbols, params, start, end, benchmark, initial_capital, cost_bps, slippage_bps, rebalance, execution, portfolio, risk_free, save}`; 201 stored, 200 with `id: null` when `save` is false |
+| GET | `/backtests` | Past runs with headline metrics (compare experiments) |
+| GET | `/backtests/{id}` | Run detail + metrics + benchmark comparison + reproducibility fields |
+| GET | `/backtests/{id}/equity` | Equity, benchmark, drawdown, cash, exposure, turnover and cost curves |
+| GET | `/backtests/{id}/trades` | Trade log (`limit`, `offset`) |
+| GET | `/backtests/{id}/verify` | Rerun from current prices; compare data hash and metrics |
+| DELETE | `/backtests/{id}` | Remove (204) |
 
 Backtests run **synchronously** in the MVP: daily data on tens of symbols over 10 to 20 years takes well under a second vectorised. A job queue is listed as a stretch goal, not built.
 
@@ -333,24 +350,24 @@ Backtests run **synchronously** in the MVP: daily data on tens of symbols over 1
 - **Max drawdown:** min of `equity / equity.cummax() − 1`.
 - **Portfolio construction:** equal weight; inverse volatility; minimum variance and maximum Sharpe via SLSQP with long-only, fully-invested, per-asset min/max bounds. Covariance from a trailing window with Ledoit-Wolf shrinkage by default; bounded inverse volatility is the visible fallback. Details in METHODOLOGY.md.
 - **Portfolio risk:** constant-mix returns; 1-day historical VaR (linear-interpolation quantile) and CVaR (the average of the same quantile function over the tail, so CVaR ≥ VaR), Gaussian VaR/CVaR alongside; closed-form OLS beta and Jensen's alpha; Euler risk contributions.
-- **Momentum:** rank by trailing 12-1 month return (skip last month), hold top-N equal weight, monthly rebalance. Time-series variant: long if trailing return > 0.
+- **Momentum:** rank by trailing 12-1 month return (skip last month), hold top-N equal weight, monthly rebalance. Time-series variant: a 1/n slot per asset, long if trailing return > 0, else cash.
 - **Mean reversion:** z-score of price vs rolling mean; enter when z < −k, exit when z crosses 0. Optional ADF test (Statsmodels) reported as a diagnostic.
-- **Benchmark comparison:** excess return, tracking error, information ratio, OLS alpha/beta (Statsmodels).
+- **Benchmark comparison:** excess return, tracking error, information ratio, OLS alpha/beta (Statsmodels, Newey-West standard errors).
 
 ### 5.1 No look-ahead bias: how it is enforced
 
-1. Strategies receive prices and return **target weights indexed by the date the signal was formed** (using data up to and including close *t*).
-2. The engine **shifts weights by one bar**: weights decided at close *t* earn the return from *t* to *t+1*. This lives in exactly one place (`engine.py`) so no strategy can bypass it.
+1. At each rebalance date *t* the engine calls the strategy with prices **sliced to end at close *t***, so it cannot read a later price; it returns target weights.
+2. The engine **executes them at close *t+1*** by default (`next_close`; `same_close` trades at close *t*, the optimistic convention). The initial allocation is a special trade at the first evaluation close, using the previous close's signal for price-dependent strategies. This lives in exactly one place (`engine.py`) so no strategy can bypass it.
 3. Rolling windows use only trailing data (`rolling(...)` with no `center=True`; no `bfill`).
 4. Portfolio optimisation inside a backtest uses only the trailing covariance window at each rebalance date.
-5. **Test that proves it:** a "future perturbation" test randomises all prices after date *T* and asserts every weight and equity value up to *T* is unchanged. Run for every strategy.
+5. **Test that proves it:** a "future perturbation" test randomises all prices after date *T* and asserts every target, trade and equity value up to *T* is unchanged. Run for every strategy and both execution modes; a deliberately cheating strategy proves the test catches leaks.
 
 ### 5.2 Costs and slippage
 
-- Turnover at each rebalance = Σ|w_new − w_drifted|.
+- Turnover at each rebalance = Σ|w_new − w_drifted| over the risky assets (cash is not charged); the day-0 allocation from cash counts too.
 - Commission cost = turnover × `cost_bps` / 10 000.
 - Slippage cost = turnover × `slippage_bps` / 10 000 (fixed-bps model in MVP; volume-based model is a stretch).
-- Costs are deducted from equity on the rebalance bar. A test checks that a zero-cost run matches the analytical gross return, and that costs scale linearly with turnover.
+- Costs are deducted from equity on the rebalance bar (defaults 5 + 5 bps). Tests check that a zero-cost run matches the analytical gross return, that costs scale linearly with turnover, and that final equity = zero-cost equity × Π(1 − τ_k c).
 
 ---
 
@@ -364,7 +381,7 @@ Each milestone ends with: code, explanation, exact commands, tests passing, and 
 | **2** ✅ | **Analytics core** | `returns.py`, `risk.py`, `correlation.py` as pure functions | Metrics match hand-computed fixtures and known values; property tests (e.g. MDD ∈ [−1, 0]) |
 | **3** ✅ | **FastAPI backend** | App factory, error handling, routers for health/instruments/prices/ingestion/analytics, Pydantic schemas | OpenAPI docs live; integration tests via `TestClient` against test Postgres |
 | **4** ✅ | **Portfolio construction & risk** | Weight methods, risk metrics, portfolio endpoints | Weights sum to 1, respect bounds; min-var ≤ equal-weight variance on fixture data |
-| 5 | Strategies + backtest engine | Strategy ABC, momentum, mean reversion, buy-and-hold, engine with costs/slippage, benchmark report, persisted runs, backtest endpoints | Look-ahead perturbation test passes; buy-and-hold matches benchmark return exactly with zero costs |
+| **5** ✅ | **Strategies + backtest engine** | Strategy ABC, momentum, mean reversion, buy-and-hold, engine with costs/slippage, benchmark report, persisted runs, backtest endpoints | Look-ahead perturbation test passes; buy-and-hold matches benchmark return exactly with zero costs |
 | 6 | Streamlit dashboard | Pages: Market data, Performance, Correlation heatmap, Portfolio builder, Backtest lab | Runs in Docker against the API; no direct DB access |
 | 7 | Polish for portfolio | Full Docker Compose, GitHub Actions CI (ruff, mypy, pytest + Postgres service), README with screenshots, METHODOLOGY.md, seed script, coverage badge | Fresh clone → `docker compose up` → working demo in one command |
 

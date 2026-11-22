@@ -39,3 +39,11 @@ class PortfolioNotFoundError(FinCombError):
 
 class PortfolioExistsError(FinCombError):
     """A portfolio with that name already exists (names are unique)."""
+
+
+class BacktestNotFoundError(FinCombError):
+    """No stored backtest run with that id."""
+
+
+class UnknownStrategyError(FinCombError):
+    """No strategy with that name."""

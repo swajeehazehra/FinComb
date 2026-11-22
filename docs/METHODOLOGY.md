@@ -214,7 +214,7 @@ flatters them. Evaluate a portfolio on a later period with the risk report.
 **Portfolio returns** are *constant mix*: $r_{p,t} = \sum_i w_i r_{i,t}$, as if
 rebalanced to the weights every day. That is the standard ex-ante convention and
 keeps the identities exact (std of $r_p$ = $\sqrt{w^\top S w}$). Drift between
-rebalances belongs to the backtester (Milestone 5). Total return, CAGR, Sharpe,
+rebalances belongs to the backtester ([Backtesting](#backtesting)). Total return, CAGR, Sharpe,
 drawdown and the rest come from the existing performance code applied to the
 portfolio's value series.
 
@@ -254,6 +254,93 @@ with NaN or infinite entries is rejected. The report uses
 the plain sample covariance of the analysis period, since it describes what
 happened; shrinkage only helps the optimiser.
 
+## Backtesting
+
+The backtester (`backtest/engine.py`) is daily, long-only and weight-based. Strategies
+only return target weights; the engine alone decides when trades happen, what they
+cost and how holdings drift.
+
+**Timing.** At each rebalance date $t$ the strategy receives adjusted closes up to and
+including close $t$, never later. Its targets are executed at close $t+1$
+(`next_close`, the default) or at close $t$ (`same_close`, which assumes you can trade
+at the close you just used for the signal, so it is optimistic). Rebalance dates are
+the last trading day of each week, month, quarter or year in the data's own
+calendar.
+
+**The final date.** No trade ever executes on the last date of the data, in either
+mode: a trade there would pay costs with no later price move to earn a return. Two
+rules ensure this. The final date is never a rebalance date (its period may also be
+incomplete). Under `next_close` the engine also does not take a signal on the
+penultimate date, because its fill would land on the final date. So if the data ends
+the trading day after a month end, a monthly `next_close` backtest makes its last trade
+at the previous month's fill, while `same_close` still trades at the month-end close
+and holds that position over the final day. The final day's return is always earned by
+the holdings of the close before it. (The strategy is not called on that skipped
+penultimate date, so a stateful strategy such as `mean_reversion` simply never sees
+it.)
+
+`mean_reversion` is evaluated daily but only trades when a position opens or closes.
+
+**Initialisation.** The first position is bought by a special trade at the close of
+the first evaluation date (day 0) in both modes, with normal costs. Strategies whose
+targets don't depend on prices (`buy_and_hold`, `fixed_weights`) are called at day 0;
+price-dependent ones use the signal from the close before day 0 under `next_close` and
+the day-0 signal under `same_close`. Enough warm-up history is loaded before the
+requested start for that; if the stored data is too short, the effective start moves
+later and a note says so. The benchmark is bought at the same day-0 close, so with
+zero costs buy-and-hold has $V(t) = V(0)\,P(t)/P(0)$ and equals the benchmark exactly.
+
+**Accounting.** Between trades holdings drift, $h_{i,t+1} = h_{i,t}(1 + r_{i,t+1})$, with
+$r$ from adjusted closes (dividends reinvested). Cash earns 0. On an execution day,
+with value $V^-$ and drifted weights $\tilde w = h / V^-$:
+
+$$\tau = \sum_i |w_i - \tilde w_i|, \qquad C = V^- \tau \frac{\text{cost\_bps} +
+\text{slippage\_bps}}{10\,000}, \qquad V^+ = V^- - C$$
+
+and the new holdings are $w V^+$, cash $(1 - \sum w) V^+$. Because costs scale the whole
+portfolio, the drift path doesn't depend on them and final equity with costs equals
+zero-cost equity $\times \prod_k (1 - \tau_k c)$. Positions are not liquidated at the
+end; the report shows what that would cost. Defaults: 5 bps commission + 5 bps
+slippage.
+
+**Trade log.** For each asset whose weight changes: notional $|\Delta w| V^-$, the raw
+close as reference price, fill price = raw close $\times (1 \pm$ slippage$)$, an
+indicative fractional quantity = notional / fill price, commission and slippage cost.
+Raw prices appear only here, following the adjusted-price rule below.
+
+**Strategies.**
+
+| Strategy | Signal at close t | Weights |
+|---|---|---|
+| `buy_and_hold` | none | given (default equal), bought once, never reset |
+| `fixed_weights` | none | given or a saved portfolio's, reset each rebalance (default monthly) |
+| `optimized` | Milestone 4 `construct()` on the trailing `lookback` returns ending at t | that method's weights; fallbacks are counted in the warnings |
+| `momentum` cross-sectional | $P(t-\text{skip}) / P(t-\text{lookback}) - 1$, default 252 / 21 | top N equal weight, ties to the first listed symbol |
+| `momentum` time-series | same score | a 1/n slot per asset with a positive score, the rest cash |
+| `mean_reversion` | $z = (P_t - \bar P) / s$ over the last `window` days (default 20) | 1/n slot opened at $z < -$entry_z (2), closed at $z \ge$ exit_z (0) |
+
+Momentum uses price ratios and the z-score is scale-invariant, so a re-adjustment
+of history (all earlier prices times a constant) changes no signal.
+
+**Report.** Strategy and benchmark statistics come from the performance code above
+applied to the equity curves. Total return and CAGR are measured from the initial
+capital, so they include the initial allocation's cost. Against the benchmark:
+excess total return and CAGR, tracking error $= \text{std}(r_s - r_b)\sqrt{252}$,
+information ratio $= 252\,\overline{(r_s - r_b)} / \text{TE}$, and the OLS regression
+$r_s - r_f = a + b(r_b - r_f) + e$ (Statsmodels) with Newey-West standard errors,
+lag $\lfloor 4 (T/100)^{2/9} \rfloor$, because daily returns are heteroskedastic and
+autocorrelated and plain t-statistics overstate significance. Its slope equals the
+closed-form beta of the portfolio risk report. Alpha is annualised ×252. For
+`mean_reversion` an augmented Dickey-Fuller test (AIC lag choice) on each asset's
+log prices is reported: it uses the whole period, so it is an in-sample diagnostic,
+never an input to the trading rule.
+
+**Reproducibility.** Each stored run keeps every input, the git commit
+(`git rev-parse HEAD`, or `FINCOMB_CODE_VERSION` when set) and a SHA-256 hash of the
+exact prices it read (sorted symbols, dates and float64 values of adjusted and raw
+closes and the benchmark). `verify` reruns it over the same effective period and
+compares the hash and every metric.
+
 ## Bias and reproducibility controls
 
 * Rolling statistics use only past data. A test changes every return after a
@@ -264,6 +351,10 @@ happened; shrinkage only helps the optimiser.
   property-based tests (Hypothesis) check invariants on hundreds of random series,
   for example "total return = last price / first price − 1" and "scaling all prices
   by a constant changes no statistic".
+* Backtests: a perturbation test replaces every price after a cut date with random
+  values and asserts that no target, trade or equity value up to the cut changes, for
+  every strategy and both execution modes; a deliberately cheating strategy shows the
+  test catches leaks.
 
 ## Adjusted prices and look-ahead: the rule for backtesting
 
@@ -273,7 +364,7 @@ later. That is harmless for **returns and ratios**, which come out the same, but
 using adjusted price **levels** in a trading rule leaks future information
 (for example "buy when the price is below $100", or a fixed-dollar stop).
 
-The backtester (Milestone 5) will therefore follow one rule:
+The backtester (Milestone 5) therefore follows one rule:
 
 * **Signals** are built only from returns and ratios of `adj_close` (momentum,
   z-scores, moving-average ratios), never from adjusted price levels or dollar
@@ -295,3 +386,10 @@ The backtester (Milestone 5) will therefore follow one rule:
   weights are fitted to one window of history. Their in-sample statistics are
   optimistic, and maximum-Sharpe weights in particular change a lot from one
   window to the next.
+* **Backtest assumptions:** fills at the close in any size with fractional shares, a
+  fixed bps cost per unit traded (no market impact or volume limits), no shorting or
+  leverage, and cash that earns nothing. Even `next_close` execution is optimistic
+  about real closing-auction costs.
+* **Overfitting:** strategy defaults are textbook values, but trying many parameter
+  sets on the same history fits noise. There is no out-of-sample split or
+  walk-forward test yet.

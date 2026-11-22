@@ -5,6 +5,7 @@ fincomb ingest AAPL MSFT SPY --start 2015-01-01
 fincomb coverage
 fincomb show AAPL --start 2024-01-01
 fincomb portfolio compare AAPL MSFT SPY TLT --max-weight 0.4
+fincomb backtest run momentum AAPL MSFT QQQ TLT GLD --start 2018-01-01
 fincomb serve            # REST API on http://127.0.0.1:8000 (docs at /docs)
 
 Commands only parse arguments and print results: the work is done by the shared
@@ -29,7 +30,12 @@ from fincomb.exceptions import FinCombError
 from fincomb.ingestion.audit import audit_data
 from fincomb.ingestion.registry import SOURCES
 from fincomb.logging_config import configure_logging
-from fincomb.services import analytics_service, ingestion_service, portfolio_service
+from fincomb.services import (
+    analytics_service,
+    backtest_service,
+    ingestion_service,
+    portfolio_service,
+)
 
 app = typer.Typer(help="FinComb command-line tools.", no_args_is_help=True)
 logger = logging.getLogger("fincomb.cli")
@@ -661,6 +667,280 @@ def portfolio_delete(name: Annotated[str, typer.Argument(help="Name or id")]) ->
     """Delete a saved portfolio."""
     record = _analyse(portfolio_service.delete_portfolio, name)
     typer.echo(f"Deleted {record.name!r} (id {record.id}).")
+
+
+# --- strategies and backtests (Milestone 5) ---------------------------------------------------
+
+backtest_app = typer.Typer(
+    help="Run, list, inspect and verify backtests (long-only, daily).", no_args_is_help=True
+)
+app.add_typer(backtest_app, name="backtest")
+
+
+@app.command()
+def strategies() -> None:
+    """Available strategies and their parameters."""
+    for s in backtest_service.strategies():
+        typer.secho(f"\n{s['name']}", bold=True)
+        typer.echo(f"  {s['description']}")
+        typer.echo(f"  default rebalance: {s['default_rebalance']}")
+        for p in s["params"]:
+            limits = ""
+            if p["choices"]:
+                limits = f" ({', '.join(p['choices'])})"
+            elif p["minimum"] is not None:
+                limits = f" ({p['minimum']:g} to {p['maximum']:g})"
+            typer.echo(f"  --param {p['name']}=...  default {p['default']}{limits}: {p['help']}")
+
+
+def _parse_params(items: list[str] | None) -> dict[str, str]:
+    params: dict[str, str] = {}
+    for item in items or []:
+        key, sep, value = item.partition("=")
+        key = key.strip()
+        if not sep or not key:
+            raise typer.BadParameter(f"{item!r}: write parameters as NAME=VALUE, e.g. top_n=2")
+        if key in params:
+            raise typer.BadParameter(f"{key} is given twice")
+        params[key] = value.strip()
+    return params
+
+
+def _bt_line(label: str, s: dict, keys) -> str:
+    return f"{label:<12}" + "".join(f"{fmt(s.get(k)):>11}" for k, fmt in keys)
+
+
+def _f(fmt):
+    return lambda x: "n/a" if x is None else fmt(x)
+
+
+_PCT = _f(_pct)
+_NUM = _f(_num)
+_STAT_COLUMNS = (
+    ("total_return", _PCT),
+    ("cagr", _PCT),
+    ("annual_volatility", _PCT),
+    ("sharpe", _NUM),
+    ("sortino", _NUM),
+    ("max_drawdown", _PCT),
+    ("calmar", _NUM),
+)
+
+
+def _print_backtest(r) -> None:
+    m = r.metrics
+    saved = f"run {r.id}" if r.id is not None else "not saved"
+    typer.echo(
+        f"\n{r.strategy} ({saved}) on {', '.join(r.symbols)}: {r.start} to {r.end} "
+        f"({m['observations']} daily returns)"
+    )
+    params = ", ".join(f"{k}={v}" for k, v in r.params.items() if v is not None) or "defaults"
+    typer.echo(
+        f"params: {params}; rebalance {r.rebalance}, execution {r.execution}, capital "
+        f"{r.initial_capital:,.0f}, costs {r.cost_bps:g} + {r.slippage_bps:g} bps"
+    )
+    _print_warnings(r.warnings)
+    header = f"\n{'':<12}" + "".join(
+        f"{h:>11}" for h in ("total", "CAGR", "vol", "Sharpe", "Sortino", "max DD", "Calmar")
+    )
+    typer.echo(header)
+    typer.echo(_bt_line("strategy", m["strategy"], _STAT_COLUMNS))
+    if m.get("benchmark"):
+        typer.echo(_bt_line(r.benchmark, m["benchmark"], _STAT_COLUMNS))
+        rel = m["relative"]
+        typer.echo(
+            f"\nvs {r.benchmark}: excess CAGR {_PCT(rel['excess_cagr'])}, tracking error "
+            f"{_PCT(rel['tracking_error'])}, information ratio {_NUM(rel['information_ratio'])}"
+        )
+        typer.echo(
+            f"alpha {_PCT(rel['alpha'])} a year (t = {_NUM(rel['alpha_t'])}, p = "
+            f"{_NUM(rel['alpha_p'])}), beta {_NUM(rel['beta'])} (t = {_NUM(rel['beta_t'])}), "
+            f"R^2 {_NUM(rel['r_squared'])}; Newey-West errors, {rel['hac_lags']} lags"
+        )
+    t = m["trading"]
+    typer.echo(
+        f"\ntrading: {t['rebalances']} rebalances, turnover {_NUM(t['annual_turnover'])}x a "
+        f"year, costs {t['total_costs']:,.2f} ({_PCT(t['costs_pct_of_capital'])} of capital), "
+        f"average cash {_PCT(t['average_cash'])}"
+    )
+    typer.echo(
+        f"final equity {t['final_equity']:,.2f}; selling everything now would cost "
+        f"{t['liquidation_cost']:,.2f}"
+    )
+    adf = (m.get("diagnostics") or {}).get("adf")
+    if adf:
+        typer.echo("\nADF on log prices (in-sample diagnostic, not used to trade):")
+        for sym, d in adf.items():
+            typer.echo(f"  {sym:<8}" + ("n/a" if d is None else f"p = {d['p_value']:.3f}"))
+    typer.echo(f"\ndata hash {r.data_hash[:16]}..., code {r.code_version[:12]}")
+    _print_alignment_notes(r.notes)
+
+
+@backtest_app.command("run")
+def backtest_run(
+    strategy: Annotated[str, typer.Argument(help="See `fincomb strategies`")],
+    symbols: Annotated[
+        list[str] | None, typer.Argument(help="Tickers already ingested (none with --portfolio)")
+    ] = None,
+    start: DateOpt = None,
+    end: DateOpt = None,
+    benchmark: Annotated[
+        str, typer.Option(help="Benchmark symbol; empty string for none")
+    ] = backtest_service.DEFAULT_BENCHMARK,
+    capital: Annotated[
+        float, typer.Option(help="Initial capital")
+    ] = backtest_service.DEFAULT_CAPITAL,
+    cost_bps: Annotated[
+        float, typer.Option(help="Commission, bps of traded value")
+    ] = backtest_service.DEFAULT_COST_BPS,
+    slippage_bps: Annotated[
+        float, typer.Option(help="Slippage, bps of traded value")
+    ] = backtest_service.DEFAULT_SLIPPAGE_BPS,
+    rebalance: Annotated[
+        str | None,
+        typer.Option(
+            help="daily, weekly, monthly, quarterly, annual or never (default: the strategy's own)"
+        ),
+    ] = None,
+    execution: Annotated[
+        str, typer.Option(help="next-close (default) or same-close (optimistic)")
+    ] = "next-close",
+    param: Annotated[
+        list[str] | None, typer.Option(help="Strategy parameter NAME=VALUE (repeatable)")
+    ] = None,
+    weights: Annotated[
+        str | None, typer.Option(help="buy_and_hold / fixed_weights: SPY=0.6,TLT=0.4")
+    ] = None,
+    portfolio: Annotated[
+        str | None, typer.Option(help="Saved portfolio name or id (fixed_weights, buy_and_hold)")
+    ] = None,
+    risk_free: RiskFreeOpt = 0.0,
+    save: Annotated[bool, typer.Option(help="Store the run (--no-save to explore)")] = True,
+) -> None:
+    """Run a backtest on stored prices and print its report."""
+    params: dict = _parse_params(param)
+    if weights is not None:
+        params["weights"] = weights
+    spec = backtest_service.BacktestSpec(
+        strategy=strategy,
+        symbols=list(symbols or []),
+        params=params,
+        start=_parse_date(start),
+        end=_parse_date(end),
+        benchmark=benchmark or None,
+        initial_capital=capital,
+        cost_bps=cost_bps,
+        slippage_bps=slippage_bps,
+        rebalance=rebalance.strip().lower() if rebalance else None,
+        execution=execution.strip().lower().replace("-", "_"),
+        portfolio=portfolio,
+        risk_free=risk_free,
+        save=save,
+    )
+    out = _analyse(backtest_service.run_backtest, spec)
+    _print_backtest(out.record)
+    if out.record.id is not None:
+        typer.secho(f"\nSaved as run {out.record.id}.", fg="green")
+
+
+@backtest_app.command("list")
+def backtest_list(
+    strategy: Annotated[str | None, typer.Option(help="Only this strategy")] = None,
+    limit: Annotated[int, typer.Option(help="How many, newest first")] = 20,
+) -> None:
+    """Stored backtests with their headline numbers."""
+    runs = _analyse(backtest_service.list_backtests, strategy, limit)
+    if not runs:
+        typer.echo("No backtests yet. Try: fincomb backtest run buy_and_hold SPY")
+        return
+    typer.echo(
+        f"{'id':>4}  {'strategy':<15}{'symbols':<24}{'from':>11}{'to':>11}"
+        f"{'CAGR':>9}{'Sharpe':>8}{'max DD':>9}{'turnover':>9}"
+    )
+    for r in runs:
+        s = r.metrics.get("strategy", {})
+        syms = ",".join(r.symbols)
+        syms = syms if len(syms) <= 22 else syms[:21] + "~"
+        flag = "  [warnings]" if r.warnings else ""
+        typer.echo(
+            f"{r.id:>4}  {r.strategy:<15}{syms:<24}{str(r.start):>11}{str(r.end):>11}"
+            f"{_PCT(s.get('cagr')):>9}{_NUM(s.get('sharpe')):>8}{_PCT(s.get('max_drawdown')):>9}"
+            f"{_NUM(r.metrics.get('trading', {}).get('annual_turnover')):>9}{flag}"
+        )
+
+
+@backtest_app.command("show")
+def backtest_show(run_id: Annotated[int, typer.Argument(help="Run id")]) -> None:
+    """The full report of a stored run."""
+    _print_backtest(_analyse(backtest_service.get_backtest, run_id))
+
+
+@backtest_app.command("trades")
+def backtest_trades(
+    run_id: Annotated[int, typer.Argument(help="Run id")],
+    limit: Annotated[int, typer.Option(help="Rows to show")] = 50,
+) -> None:
+    """Trade log (quantities are indicative fractional shares)."""
+    trades, total = _analyse(backtest_service.backtest_trades, run_id, limit)
+    typer.echo(
+        f"{'date':<12}{'kind':<10}{'symbol':<8}{'side':<6}{'from':>8}{'to':>8}"
+        f"{'notional':>14}{'fill':>11}{'quantity':>12}{'costs':>10}"
+    )
+    for t in trades:
+        typer.echo(
+            f"{str(t.date):<12}{t.kind:<10}{t.symbol:<8}{t.side:<6}{_pct(t.weight_before):>8}"
+            f"{_pct(t.weight_after):>8}{t.notional:>14,.2f}{t.fill_price:>11,.2f}"
+            f"{t.quantity:>12,.3f}{t.commission + t.slippage_cost:>10,.2f}"
+        )
+    if total > len(trades):
+        typer.echo(f"... {total - len(trades)} more (use --limit)")
+
+
+@backtest_app.command("equity")
+def backtest_equity(
+    run_id: Annotated[int, typer.Argument(help="Run id")],
+    csv: Annotated[str | None, typer.Option(help="Write the full daily curve to this file")] = None,
+) -> None:
+    """Equity curve summary, or the whole curve as CSV."""
+    frame = _analyse(backtest_service.backtest_equity, run_id)
+    if csv:
+        frame.to_csv(csv, index_label="date")
+        typer.secho(f"Wrote {len(frame)} rows to {csv}", fg="green")
+        return
+    show = frame if len(frame) <= 12 else frame.iloc[list(range(5)) + list(range(-5, 0))]
+    typer.echo(f"{'date':<12}{'equity':>14}{'benchmark':>14}{'drawdown':>10}{'cash':>12}")
+    for i, (ts, r) in enumerate(show.iterrows()):
+        if len(frame) > 12 and i == 5:
+            typer.echo("...")
+        bench = "n/a" if r.benchmark_equity != r.benchmark_equity else f"{r.benchmark_equity:,.2f}"
+        typer.echo(
+            f"{str(ts.date()):<12}{r.equity:>14,.2f}{bench:>14}{_pct(r.drawdown):>10}"
+            f"{r.cash:>12,.2f}"
+        )
+
+
+@backtest_app.command("verify")
+def backtest_verify(run_id: Annotated[int, typer.Argument(help="Run id")]) -> None:
+    """Rerun a stored backtest from current data and compare the data hash and metrics."""
+    v = _analyse(backtest_service.verify_backtest, run_id)
+    if v.reproducible:
+        typer.secho(f"Run {v.run_id} is reproducible: same data hash, same metrics.", fg="green")
+    else:
+        typer.secho(f"Run {v.run_id} is NOT reproducible from current data.", fg="red", bold=True)
+        if not v.data_hash_matches:
+            typer.echo("The stored prices changed since the run (re-ingested or re-adjusted).")
+        if v.mismatched_metrics:
+            typer.echo("Metrics that differ: " + ", ".join(v.mismatched_metrics[:10]))
+    typer.echo(f"code then {v.stored_code_version[:12]}, now {v.current_code_version[:12]}")
+    if not v.reproducible:
+        raise typer.Exit(1)
+
+
+@backtest_app.command("delete")
+def backtest_delete(run_id: Annotated[int, typer.Argument(help="Run id")]) -> None:
+    """Delete a stored run with its equity curve and trades."""
+    r = _analyse(backtest_service.delete_backtest, run_id)
+    typer.echo(f"Deleted run {r.id} ({r.strategy}).")
 
 
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")

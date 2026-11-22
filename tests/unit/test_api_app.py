@@ -66,6 +66,12 @@ def test_openapi_lists_every_route(client):
         "/portfolios/risk": {"post"},
         "/portfolios/{portfolio_id}": {"get", "delete"},
         "/portfolios/{portfolio_id}/risk": {"get"},
+        "/strategies": {"get"},
+        "/backtests": {"get", "post"},
+        "/backtests/{run_id}": {"get", "delete"},
+        "/backtests/{run_id}/equity": {"get"},
+        "/backtests/{run_id}/trades": {"get"},
+        "/backtests/{run_id}/verify": {"get"},
     }
     assert {p.removeprefix(API_PREFIX) for p in paths} == set(expected)
     for path, methods in expected.items():
