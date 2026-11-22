@@ -2,14 +2,14 @@
 
 An end-to-end financial intelligence and quantitative research platform: it ingests
 and validates market data, stores it in PostgreSQL, analyses performance and risk, builds and risk-checks
-portfolios, serves it all through a REST API, and (in later milestones) backtests
-trading strategies without look-ahead bias.
+portfolios, backtests trading strategies without look-ahead bias, and serves it all
+through a REST API.
 
 Tech stack: Python · PostgreSQL · SQLAlchemy · Alembic · FastAPI · pandas / NumPy ·
 SciPy / Statsmodels · Plotly · Streamlit · Pytest · Docker
 
-> Status: **Milestone 4 of 7 done** (data pipeline, analytics core, REST API, and
-> portfolio construction and risk). See
+> Status: **Milestone 5 of 7 done** (data pipeline, analytics core, REST API,
+> portfolio construction and risk, and strategy backtesting). See
 > the [roadmap](#roadmap).
 
 ## What works today
@@ -43,6 +43,14 @@ SciPy / Statsmodels · Plotly · Streamlit · Pytest · Docker
   and risk reports with historical and Gaussian VaR/CVaR, beta/alpha and risk
   contributions, from both `fincomb portfolio ...` and `/api/v1/portfolios`. See
   [docs/MILESTONE_4.md](docs/MILESTONE_4.md).
+- **Strategy backtesting:** buy-and-hold, fixed weights (rebalanced, or a saved
+  portfolio), re-optimised portfolios, 12-1 momentum and mean reversion, run by one
+  daily engine that owns timing (next-close execution by default), drift and
+  costs. Look-ahead is prevented by construction and proven by a perturbation test;
+  reports compare against a benchmark (tracking error, information ratio, Newey-West
+  alpha/beta); every stored run carries a data hash and git commit and can be
+  re-verified. `fincomb backtest ...` and `/api/v1/backtests`. See
+  [docs/MILESTONE_5.md](docs/MILESTONE_5.md).
 
 ## Quick start
 
@@ -65,6 +73,7 @@ fincomb analyze AAPL MSFT SPY --risk-free 0.04
 fincomb correlation AAPL MSFT SPY
 fincomb drawdowns SPY
 fincomb portfolio compare AAPL MSFT SPY --max-weight 0.6
+fincomb backtest run momentum AAPL MSFT SPY --start 2018-01-01 --param top_n=2
 pytest
 fincomb serve                     # API on http://127.0.0.1:8000, docs at /docs
 ```
@@ -80,6 +89,9 @@ curl "http://127.0.0.1:8000/api/v1/health"
 curl "http://127.0.0.1:8000/api/v1/instruments/AAPL"
 curl "http://127.0.0.1:8000/api/v1/analytics/performance?symbols=AAPL,MSFT,SPY&risk_free=0.04"
 curl "http://127.0.0.1:8000/api/v1/analytics/correlation?symbols=SPY,QQQ,TLT,GLD"
+curl "http://127.0.0.1:8000/api/v1/strategies"
+curl -X POST "http://127.0.0.1:8000/api/v1/backtests" -H "Content-Type: application/json" \
+     -d '{"strategy": "buy_and_hold", "symbols": ["SPY"], "cost_bps": 0, "slippage_bps": 0}'
 ```
 
 Errors always have the shape `{"error": {"code", "message", "details"}}`. The full
@@ -96,7 +108,9 @@ src/fincomb/
   validation/          data-quality rules
   analytics/           returns, risk, VaR/CVaR, beta, correlation (pure functions, no I/O)
   portfolio/           covariance, optimiser, weighting methods, portfolio risk (pure)
-  services/            shared by CLI and API: load prices, analytics, portfolios, ingestion
+  strategies/          buy-and-hold, fixed weights, optimized, momentum, mean reversion (pure)
+  backtest/            engine, costs, rebalance schedule, report, data hash (pure)
+  services/            shared by CLI and API: prices, analytics, portfolios, backtests, ingestion
   api/                 FastAPI app factory, routers, Pydantic schemas, error mapping
   cli.py               `fincomb` command (thin: parses arguments, calls services)
 migrations/            Alembic schema migrations
@@ -112,7 +126,7 @@ docs/                  architecture and milestone guides
 2. ✅ Analytics core: returns, volatility, Sharpe, drawdown, correlation
 3. ✅ FastAPI backend: REST API over the data and analytics
 4. ✅ Portfolio construction and risk
-5. Strategies (momentum, mean reversion) and a backtest engine with costs and slippage
+5. ✅ Strategies (momentum, mean reversion) and a backtest engine with costs and slippage
 6. Streamlit dashboard
 7. CI, documentation and polish
 
