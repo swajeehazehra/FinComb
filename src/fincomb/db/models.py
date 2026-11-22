@@ -1,7 +1,5 @@
-"""SQLAlchemy ORM models: market data (Milestone 1) and portfolios (Milestone 4).
-
-Backtest tables arrive in Milestone 5 as a new migration.
-"""
+"""SQLAlchemy ORM models: market data (Milestone 1), portfolios (Milestone 4) and
+backtest runs (Milestone 5)."""
 
 from __future__ import annotations
 
@@ -206,4 +204,91 @@ class PortfolioWeight(Base):
     weight: Mapped[float] = mapped_column(Float, nullable=False)
 
     portfolio: Mapped[Portfolio] = relationship(back_populates="weights")
+    instrument: Mapped[Instrument] = relationship()
+
+
+class BacktestRun(Base):
+    """One stored backtest: every input needed to rerun it, and its metrics.
+
+    Only successful runs are stored. `data_hash` and `code_version` make it checkable
+    later (`fincomb backtest verify`).
+    """
+
+    __tablename__ = "backtest_runs"
+    __table_args__ = (
+        CheckConstraint("initial_capital > 0", name="ck_backtest_runs_capital"),
+        CheckConstraint("cost_bps >= 0 AND slippage_bps >= 0", name="ck_backtest_runs_costs"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    strategy: Mapped[str] = mapped_column(String(50), nullable=False)
+    params: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    symbols: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False)
+    benchmark_symbol: Mapped[str | None] = mapped_column(String(20))
+    start_date: Mapped[date] = mapped_column(Date, nullable=False)  # effective period
+    end_date: Mapped[date] = mapped_column(Date, nullable=False)
+    requested_start: Mapped[date | None] = mapped_column(Date)
+    requested_end: Mapped[date | None] = mapped_column(Date)
+    warmup_start: Mapped[date | None] = mapped_column(Date)  # first price date read
+    rebalance_frequency: Mapped[str] = mapped_column(String(10), nullable=False)
+    execution: Mapped[str] = mapped_column(String(12), nullable=False)
+    initial_capital: Mapped[float] = mapped_column(Float, nullable=False)
+    cost_bps: Mapped[float] = mapped_column(Float, nullable=False)
+    slippage_bps: Mapped[float] = mapped_column(Float, nullable=False)
+    risk_free: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    portfolio_id: Mapped[int | None] = mapped_column(
+        ForeignKey("portfolios.id", ondelete="SET NULL")
+    )
+    code_version: Mapped[str] = mapped_column(String(40), nullable=False)
+    data_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    metrics: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    warnings: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    notes: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    duration_ms: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    def __repr__(self) -> str:
+        return f"BacktestRun({self.id}, {self.strategy})"
+
+
+class BacktestEquity(Base):
+    __tablename__ = "backtest_equity"
+
+    run_id: Mapped[int] = mapped_column(
+        ForeignKey("backtest_runs.id", ondelete="CASCADE"), primary_key=True
+    )
+    bar_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    equity: Mapped[float] = mapped_column(Float, nullable=False)
+    cash: Mapped[float] = mapped_column(Float, nullable=False)
+    gross_exposure: Mapped[float] = mapped_column(Float, nullable=False)
+    benchmark_equity: Mapped[float | None] = mapped_column(Float)
+    drawdown: Mapped[float] = mapped_column(Float, nullable=False)
+    turnover: Mapped[float] = mapped_column(Float, nullable=False)
+    costs: Mapped[float] = mapped_column(Float, nullable=False)
+
+
+class BacktestTrade(Base):
+    __tablename__ = "backtest_trades"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[int] = mapped_column(
+        ForeignKey("backtest_runs.id", ondelete="CASCADE"), nullable=False
+    )  # indexed with bar_date by migration 0004
+    bar_date: Mapped[date] = mapped_column(Date, nullable=False)
+    instrument_id: Mapped[int] = mapped_column(
+        ForeignKey("instruments.id", ondelete="RESTRICT"), nullable=False
+    )
+    kind: Mapped[str] = mapped_column(String(10), nullable=False)  # init | rebalance
+    side: Mapped[str] = mapped_column(String(4), nullable=False)  # buy | sell
+    weight_before: Mapped[float] = mapped_column(Float, nullable=False)
+    weight_after: Mapped[float] = mapped_column(Float, nullable=False)
+    quantity: Mapped[float] = mapped_column(Float, nullable=False)
+    reference_price: Mapped[float] = mapped_column(Float, nullable=False)
+    fill_price: Mapped[float] = mapped_column(Float, nullable=False)
+    notional: Mapped[float] = mapped_column(Float, nullable=False)
+    commission: Mapped[float] = mapped_column(Float, nullable=False)
+    slippage_cost: Mapped[float] = mapped_column(Float, nullable=False)
+
     instrument: Mapped[Instrument] = relationship()
