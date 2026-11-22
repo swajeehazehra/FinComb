@@ -16,6 +16,7 @@ dependencies = [
     "pandas>=2.2,<4",
     "numpy>=1.26,<3",
     "scipy>=1.11,<2",  # SLSQP optimiser and normal quantiles (Milestone 4)
+    "statsmodels>=0.14,<1",  # HAC regression and ADF test (Milestone 5)
     "yfinance>=0.2.50",
     "typer>=0.12,<1",
     "tzdata>=2024.1",  # time-zone database for zoneinfo (Windows has none built in)
@@ -47,6 +48,7 @@ filterwarnings = [
 ]
 markers = [
     "integration: needs a running PostgreSQL (skipped automatically if unreachable)",
+    "performance: backtest timing checks (skip with -m \"not performance\")",
 ]
 
 [tool.ruff]
