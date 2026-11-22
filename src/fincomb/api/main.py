@@ -14,15 +14,24 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from fincomb import __version__
 from fincomb.api.errors import install_error_handlers
-from fincomb.api.routers import analytics, health, ingestion, instruments, portfolios, prices
+from fincomb.api.routers import (
+    analytics,
+    backtests,
+    health,
+    ingestion,
+    instruments,
+    portfolios,
+    prices,
+    strategies,
+)
 from fincomb.config import Settings, get_settings
 from fincomb.db.base import make_engine, make_session_factory
 
 API_PREFIX = "/api/v1"
 
 DESCRIPTION = """
-Market data, data-quality audit, performance analytics, and portfolio construction
-and risk for daily price history.
+Market data, data-quality audit, performance analytics, portfolio construction
+and risk, and strategy backtests for daily price history.
 
 * Dates are ISO `YYYY-MM-DD`; ranges are inclusive.
 * Multi-symbol endpoints use **inner alignment** by default (only dates every symbol
@@ -31,6 +40,9 @@ and risk for daily price history.
 * Statistics that are undefined (e.g. Sharpe with zero volatility) are `null`.
 * Portfolio responses carry `warnings` (optimiser fallback, no positive excess
   return, unreliable tail estimates): read them before trusting the numbers.
+* Backtests (`/strategies`, `/backtests`) are long-only and daily: a signal formed at
+  close t trades at close t+1 by default, and every run stores its code version and
+  a hash of its input prices so it can be verified later.
 * Errors always look like `{"error": {"code", "message", "details"}}`.
 """
 
@@ -55,7 +67,16 @@ def create_app(
     app.state.session_factory = session_factory
     install_error_handlers(app)
 
-    for module in (health, instruments, prices, ingestion, analytics, portfolios):
+    for module in (
+        health,
+        instruments,
+        prices,
+        ingestion,
+        analytics,
+        portfolios,
+        strategies,
+        backtests,
+    ):
         app.include_router(module.router, prefix=API_PREFIX)
 
     @app.get("/", include_in_schema=False)

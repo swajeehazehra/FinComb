@@ -21,6 +21,7 @@ from sqlalchemy.exc import OperationalError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from fincomb.exceptions import (
+    BacktestNotFoundError,
     DataOwnershipError,
     DataSourceAuthError,
     DataSourceError,
@@ -30,6 +31,7 @@ from fincomb.exceptions import (
     PortfolioExistsError,
     PortfolioNotFoundError,
     SymbolNotFoundError,
+    UnknownStrategyError,
     ValidationError,
 )
 
@@ -58,6 +60,8 @@ def not_found(what: str, key: object) -> ApiError:
 DOMAIN_ERRORS: dict[type[FinCombError], tuple[int, str]] = {
     SymbolNotFoundError: (404, "symbol_not_found"),
     PortfolioNotFoundError: (404, "not_found"),
+    BacktestNotFoundError: (404, "not_found"),
+    UnknownStrategyError: (422, "invalid_request"),
     PortfolioExistsError: (409, "already_exists"),
     DataOwnershipError: (409, "data_ownership_conflict"),
     InsufficientDataError: (422, "insufficient_data"),
